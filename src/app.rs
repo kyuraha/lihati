@@ -1284,6 +1284,7 @@ fn preview_pane(ui: &mut egui::Ui, doc: &mut Document, pv: &mut preview::Preview
     ScrollArea::vertical()
         .id_salt("preview-scroll")
         .auto_shrink(false)
+        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
         .show(ui, |ui| {
             let base = doc.path.as_ref().and_then(|p| parent_of(p));
             let version = doc.version;

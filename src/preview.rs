@@ -26,7 +26,6 @@ pub struct Preview {
     images: HashMap<PathBuf, ((SystemTime, u64), TextureHandle)>,
     code: HashMap<(u64, bool), Arc<Vec<Spans>>>,
     pub content_height: f32,
-    ids: u64,
 }
 
 impl Preview {
@@ -36,13 +35,7 @@ impl Preview {
             images: HashMap::new(),
             code: HashMap::new(),
             content_height: 0.0,
-            ids: 0,
         }
-    }
-
-    fn next_id(&mut self) -> u64 {
-        self.ids += 1;
-        self.ids
     }
 
     fn events_for(&mut self, version: u64, text: &str) -> Arc<Vec<Event<'static>>> {
@@ -138,6 +131,7 @@ struct Cfg<'a> {
     dark: bool,
     pv: &'a mut Preview,
     depth: usize,
+    block_no: usize,
 }
 
 const MAX_NESTING: usize = 48;
@@ -183,7 +177,7 @@ fn heading_num(level: &HeadingLevel) -> u8 {
 
 pub fn show(ui: &mut Ui, pv: &mut Preview, text: &str, base: Option<&Path>, dark: bool, version: u64) {
     let evs = pv.events_for(version, text);
-    let mut cfg = Cfg { base, dark, pv, depth: 0 };
+    let mut cfg = Cfg { base, dark, pv, depth: 0, block_no: 0 };
     let top = ui.cursor().top();
     let mut i = 0usize;
     let mut first = true;
@@ -688,7 +682,8 @@ fn code_block(ui: &mut Ui, cfg: &mut Cfg, evs: &[Event], i: &mut usize, lang: Op
     let (_, bg) = code_theme(cfg.dark);
     let pal = theme::palette(cfg.dark);
 
-    let id = Id::new(("lihati-code-copy", cfg.pv.next_id()));
+    cfg.block_no += 1;
+    let id = Id::new(("lihati-code-copy", cfg.block_no));
     let frame = egui::Frame::default()
         .fill(bg)
         .corner_radius(4)
@@ -749,9 +744,18 @@ fn plain_cell(evs: &[Event], i: &mut usize) -> String {
     let mut s = String::new();
     while *i < evs.len() {
         match &evs[*i] {
-            Event::Text(t) => s.push_str(t),
-            Event::Code(c) => s.push_str(c),
-            Event::SoftBreak => s.push(' '),
+            Event::Text(t) => {
+                s.push_str(t);
+                *i += 1;
+            }
+            Event::Code(c) => {
+                s.push_str(c);
+                *i += 1;
+            }
+            Event::SoftBreak => {
+                s.push(' ');
+                *i += 1;
+            }
             Event::End(e) if closes(&Tag::TableCell, e) => {
                 *i += 1;
                 break;
@@ -817,7 +821,8 @@ fn table(
     }
 
     let ncols = aligns.len().max(header.len()).max(rows.iter().map(|r| r.len()).max().unwrap_or(0)).max(1);
-    let gid = Id::new(("lihati-table", cfg.pv.next_id()));
+    cfg.block_no += 1;
+    let gid = Id::new(("lihati-table", cfg.block_no));
     let pal = theme::palette(cfg.dark);
 
     egui::Grid::new(gid)
