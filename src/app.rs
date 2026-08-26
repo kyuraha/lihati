@@ -47,6 +47,7 @@ pub struct App {
     doc: Document,
     root: Option<PathBuf>,
     expanded: HashSet<PathBuf>,
+    outline_collapsed: HashSet<usize>,
     dir_cache: HashMap<PathBuf, (Instant, Arc<Vec<Entry>>)>,
     preview: preview::Preview,
     toasts: Vec<Toast>,
@@ -63,6 +64,7 @@ pub struct App {
     derived_version: u64,
     last_watch: Instant,
     last_store: Instant,
+    last_scroll: Instant,
     cur_dark: bool,
     title: String,
 }
@@ -70,6 +72,7 @@ pub struct App {
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>, file: Option<PathBuf>) -> Self {
         theme::init_fonts(&cc.egui_ctx);
+        preview::warmup();
         let state = state::load(cc);
         theme::apply(&cc.egui_ctx);
         theme::set_pref(&cc.egui_ctx, state.theme);
@@ -80,6 +83,7 @@ impl App {
             doc: Document::new(),
             root: None,
             expanded: HashSet::new(),
+            outline_collapsed: HashSet::new(),
             dir_cache: HashMap::new(),
             preview: preview::Preview::new(),
             toasts: Vec::new(),
@@ -96,6 +100,7 @@ impl App {
             derived_version: u64::MAX,
             last_watch: now,
             last_store: now,
+            last_scroll: now - Duration::from_secs(60),
             cur_dark: true,
             title: String::new(),
         };
@@ -488,14 +493,14 @@ impl App {
                     ui.label(RichText::new("FILES").size(11.0).color(pal.weak));
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if ui
-                            .add(Button::new(RichText::new("\u{00ab}").size(12.0)).frame(false))
+                            .add(Button::new(RichText::new("\u{00ab}").size(12.0)))
                             .on_hover_text("Hide files panel")
                             .clicked()
                         {
                             self.state.show_dir = false;
                         }
                         if ui
-                            .add(Button::new(RichText::new("\u{2026}").size(12.0)).frame(false))
+                            .add(Button::new(RichText::new("\u{2026}").size(12.0)))
                             .on_hover_text("Choose folder\u{2026}")
                             .clicked()
                         {
@@ -547,7 +552,7 @@ impl App {
                 let expanded = self.expanded.contains(&e.path);
                 let mut toggle = false;
                 ui.horizontal(|ui| {
-                    ui.add_space(depth as f32 * 14.0 + 4.0);
+                    ui.add_space(depth as f32 * 11.0 + 2.0);
                     if draw_caret(ui, expanded).clicked() {
                         toggle = true;
                     }
@@ -571,8 +576,11 @@ impl App {
                 let selected = self.doc.path.as_deref() == Some(e.path.as_path());
                 let path = e.path.clone();
                 ui.horizontal(|ui| {
-                    ui.add_space(depth as f32 * 14.0 + 18.0);
-                    let label = RichText::new(e.name.clone()).size(13.0);
+                    ui.add_space(depth as f32 * 11.0 + 16.0);
+                    let mut label = RichText::new(e.name.clone()).size(13.0);
+                    if selected {
+                        label = label.color(theme::palette(ui.visuals().dark_mode).accent);
+                    }
                     if ui.selectable_label(selected, label).clicked() {
                         self.open_path(path);
                     }
@@ -663,7 +671,7 @@ impl App {
                     ui.label(RichText::new("OUTLINE").size(11.0).color(pal.weak));
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if ui
-                            .add(Button::new(RichText::new("\u{00bb}").size(12.0)).frame(false))
+                            .add(Button::new(RichText::new("\u{00bb}").size(12.0)))
                             .on_hover_text("Hide outline")
                             .clicked()
                         {
@@ -686,38 +694,81 @@ impl App {
                             });
                             return;
                         }
-                        for h in headings {
-                            let indent = ((h.level as i32 - 1).max(0)) as f32 * 14.0;
-                            let size = match h.level {
-                                1 => 13.5,
-                                2 => 13.0,
-                                3 => 12.6,
-                                _ => 12.2,
-                            };
-                            let text = if h.title.trim().is_empty() {
-                                "(untitled)".to_string()
-                            } else {
-                                h.title.clone()
-                            };
-                            let mut rt = RichText::new(text).size(size);
-                            rt = if h.level <= 2 { rt.color(pal.text) } else { rt.color(pal.weak) };
-                            if h.level <= 1 {
-                                rt = rt.font(eframe::egui::FontId::new(size, theme::family_bold()));
-                            }
-                            let line = h.line;
-                            ui.horizontal(|ui| {
-                                ui.add_space(indent + 4.0);
-                                if ui
-                                    .add(Button::new(rt).frame(false).truncate())
-                                    .on_hover_text(format!("Go to line {}", line + 1))
-                                    .clicked()
-                                {
-                                    self.jump = Some(line);
-                                    if self.state.view == ViewMode::Preview {
-                                        self.state.view = ViewMode::Source;
-                                    }
+
+                        let mut open_ancestors: Vec<(u8, usize)> = Vec::new();
+                        for (idx, h) in headings.iter().enumerate() {
+                            while let Some(&(lvl, _)) = open_ancestors.last() {
+                                if lvl >= h.level {
+                                    open_ancestors.pop();
+                                } else {
+                                    break;
                                 }
-                            });
+                            }
+                            let visible = open_ancestors
+                                .iter()
+                                .all(|(_, line)| !self.outline_collapsed.contains(line));
+                            let has_children = headings
+                                .get(idx + 1)
+                                .map(|n| n.level > h.level)
+                                .unwrap_or(false);
+
+                            if visible {
+                                let indent = ((h.level as i32 - 1).max(0)) as f32 * 12.0 + 4.0;
+                                let size = match h.level {
+                                    1 => 13.2,
+                                    2 => 12.8,
+                                    3 => 12.4,
+                                    _ => 12.0,
+                                };
+                                let text = if h.title.trim().is_empty() {
+                                    "(untitled)".to_string()
+                                } else {
+                                    h.title.clone()
+                                };
+                                let mut rt = RichText::new(text).size(size);
+                                rt = if h.level <= 2 {
+                                    rt.color(pal.text)
+                                } else {
+                                    rt.color(pal.weak)
+                                };
+                                if h.level == 1 {
+                                    rt = rt.font(eframe::egui::FontId::new(
+                                        size,
+                                        theme::family_bold(),
+                                    ));
+                                }
+                                let line = h.line;
+                                ui.horizontal(|ui| {
+                                    ui.add_space(indent);
+                                    if has_children {
+                                        let is_open =
+                                            !self.outline_collapsed.contains(&line);
+                                        if draw_caret_small(ui, is_open).clicked() {
+                                            if is_open {
+                                                self.outline_collapsed.insert(line);
+                                            } else {
+                                                self.outline_collapsed.remove(&line);
+                                            }
+                                        }
+                                    } else {
+                                        ui.add_space(14.0);
+                                    }
+                                    if ui
+                                        .add(Button::new(rt).truncate())
+                                        .on_hover_text(format!("Go to line {}", line + 1))
+                                        .clicked()
+                                    {
+                                        self.jump = Some(line);
+                                        if self.state.view == ViewMode::Preview {
+                                            self.state.view = ViewMode::Source;
+                                        }
+                                    }
+                                });
+                            }
+
+                            if has_children && !self.outline_collapsed.contains(&h.line) {
+                                open_ancestors.push((h.level, h.line));
+                            }
                         }
                     });
             });
@@ -776,9 +827,10 @@ impl App {
                                 .font(FontId::new(17.0, theme::family_bold())),
                         );
                         ui.add_space(6.0);
-                        ui.label(RichText::new(
+                        ui.add(Label::new(RichText::new(
                             "Your document has unsaved edits. Save before continuing?",
-                        ));
+                        ))
+                        .wrap());
                         ui.add_space(12.0);
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             if small_btn(ui, "Cancel").clicked() {
@@ -838,7 +890,8 @@ impl App {
                         .corner_radius(6)
                         .inner_margin(Margin::symmetric(12, 6))
                         .show(ui, |ui| {
-                            ui.label(RichText::new(t.msg.clone()).size(13.0));
+                            ui.set_max_width(380.0);
+                            ui.add(Label::new(RichText::new(t.msg.clone()).size(13.0)).wrap());
                         });
                     ui.add_space(4.0);
                 }
@@ -1027,20 +1080,26 @@ impl eframe::App for App {
         }
 
         self.handle_drop(ctx);
+        let scroll_pending = ctx.input(|i| {
+            i.raw_scroll_delta != egui::Vec2::ZERO || i.smooth_scroll_delta != egui::Vec2::ZERO
+        });
+        if scroll_pending {
+            self.last_scroll = Instant::now();
+        }
         if self.pending.is_none() {
             self.shortcuts(ctx);
         }
         self.watch_tick();
 
         self.draw_toolbar(ctx);
+        self.draw_status(ctx);
         if self.state.show_dir {
             self.draw_files_panel(ctx);
         }
-        self.draw_center(ctx);
         if self.state.show_outline {
             self.draw_outline_panel(ctx);
         }
-        self.draw_status(ctx);
+        self.draw_center(ctx);
         self.draw_modal(ctx);
         self.draw_find(ctx);
         self.draw_toasts(ctx);
@@ -1056,6 +1115,8 @@ impl eframe::App for App {
 
         let wake = if !self.toasts.is_empty() {
             Some(Duration::from_millis(120))
+        } else if self.last_scroll.elapsed() < Duration::from_millis(500) {
+            Some(Duration::from_millis(8))
         } else if self.doc.path.is_some() {
             let focused = ctx.input(|i| i.viewport().focused.unwrap_or(true));
             Some(if focused { WATCH_INTERVAL } else { WATCH_INTERVAL_BACKGROUND })
@@ -1098,10 +1159,11 @@ fn parent_of(path: &Path) -> Option<PathBuf> {
 
 fn toggle_btn(ui: &mut egui::Ui, label: &str, active: bool, pal: &theme::Palette) -> egui::Response {
     let text = RichText::new(label).size(13.0);
-    let mut btn = Button::new(text.clone()).frame(false);
-    if active {
-        btn = Button::new(text.color(pal.accent)).frame(false);
-    }
+    let btn = if active {
+        Button::new(text.color(pal.accent))
+    } else {
+        Button::new(text)
+    };
     ui.add(btn)
 }
 
@@ -1128,12 +1190,10 @@ fn segmented_view(
                         .size(12.5)
                         .color(if sel { pal.text } else { pal.weak });
                     let mut btn = Button::new(txt);
-                    btn = if sel {
-                        btn.fill(if dark { pal.active } else { pal.extreme })
-                            .stroke(egui::Stroke::new(1.0_f32, pal.stroke))
-                    } else {
-                        btn.fill(Color32::TRANSPARENT)
-                    };
+                    if sel {
+                        btn = btn.fill(if dark { pal.active } else { pal.extreme })
+                            .stroke(egui::Stroke::new(1.0_f32, pal.stroke));
+                    }
                     if ui.add(btn).clicked() {
                         picked = Some(m);
                     }
@@ -1211,7 +1271,7 @@ fn draw_caret(ui: &mut egui::Ui, expanded: bool) -> egui::Response {
     let pal = theme::palette(ui.visuals().dark_mode);
     let (rect, resp) = ui.allocate_exact_size(egui::Vec2::splat(16.0), Sense::click());
     if resp.hovered() {
-        ui.painter().rect_filled(rect.expand(2.0), 3.0, pal.hover);
+        ui.painter().rect_filled(rect.expand(2.0), 3, pal.hover);
     }
     let c = rect.center();
     let s = 3.4f32;
@@ -1232,6 +1292,29 @@ fn draw_caret(ui: &mut egui::Ui, expanded: bool) -> egui::Response {
     resp
 }
 
+fn draw_caret_small(ui: &mut egui::Ui, expanded: bool) -> egui::Response {
+    let pal = theme::palette(ui.visuals().dark_mode);
+    let (rect, resp) = ui.allocate_exact_size(egui::Vec2::new(13.0, 16.0), Sense::click());
+    let color = if resp.hovered() { pal.text } else { pal.weak };
+    let c = rect.center();
+    let s = 2.8f32;
+    let pts: Vec<egui::Pos2> = if expanded {
+        vec![
+            egui::pos2(c.x - s, c.y - s * 0.55),
+            egui::pos2(c.x + s, c.y - s * 0.55),
+            egui::pos2(c.x, c.y + s * 0.9),
+        ]
+    } else {
+        vec![
+            egui::pos2(c.x - s * 0.55, c.y - s),
+            egui::pos2(c.x - s * 0.55, c.y + s),
+            egui::pos2(c.x + s * 0.9, c.y),
+        ]
+    };
+    ui.painter().add(egui::Shape::convex_polygon(pts, color, egui::Stroke::NONE));
+    resp
+}
+
 fn editor_pane(
     ui: &mut egui::Ui,
     doc: &mut Document,
@@ -1241,6 +1324,8 @@ fn editor_pane(
     ScrollArea::both()
         .id_salt("editor-scroll")
         .auto_shrink(false)
+        .drag_to_scroll(false)
+        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
         .show(ui, |ui| {
             let margin: f32 = 8.0;
             ui.add_space(2.0);
@@ -1284,6 +1369,7 @@ fn preview_pane(ui: &mut egui::Ui, doc: &mut Document, pv: &mut preview::Preview
     ScrollArea::vertical()
         .id_salt("preview-scroll")
         .auto_shrink(false)
+        .drag_to_scroll(false)
         .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
         .show(ui, |ui| {
             let base = doc.path.as_ref().and_then(|p| parent_of(p));

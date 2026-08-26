@@ -48,7 +48,7 @@ pub struct Palette {
     pub text: Color32,
     pub weak: Color32,
     pub accent: Color32,
-    pub accent_soft: Color32,
+    pub selection: Color32,
     pub warn: Color32,
     pub warn_soft: Color32,
     pub err: Color32,
@@ -67,7 +67,7 @@ pub fn palette(dark: bool) -> Palette {
             text: Color32::from_rgb(0xd8, 0xdd, 0xe5),
             weak: Color32::from_rgb(0x8f, 0x97, 0xa4),
             accent: Color32::from_rgb(0x5b, 0x9d, 0xff),
-            accent_soft: Color32::from_rgba_premultiplied(0x5b, 0x9d, 0xff, 40),
+            selection: Color32::from_rgba_premultiplied(0x5b, 0x9d, 0xff, 115),
             warn: Color32::from_rgb(0xe8, 0xb4, 0x5a),
             warn_soft: Color32::from_rgba_premultiplied(0xe8, 0xb4, 0x5a, 34),
             err: Color32::from_rgb(0xef, 0x7a, 0x70),
@@ -84,7 +84,7 @@ pub fn palette(dark: bool) -> Palette {
             text: Color32::from_rgb(0x21, 0x26, 0x2d),
             weak: Color32::from_rgb(0x6b, 0x73, 0x82),
             accent: Color32::from_rgb(0x2f, 0x6f, 0xed),
-            accent_soft: Color32::from_rgba_premultiplied(0x2f, 0x6f, 0xed, 28),
+            selection: Color32::from_rgba_premultiplied(0x2f, 0x6f, 0xed, 85),
             warn: Color32::from_rgb(0xb7, 0x79, 0x1f),
             warn_soft: Color32::from_rgba_premultiplied(0xe8, 0xb4, 0x5a, 60),
             err: Color32::from_rgb(0xd6, 0x45, 0x45),
@@ -114,7 +114,7 @@ fn styled(dark: bool) -> Style {
     v.widgets.active.bg_fill = p.active;
     v.widgets.active.bg_stroke = egui::Stroke::NONE;
     v.widgets.active.fg_stroke = egui::Stroke::new(1.0_f32, p.text);
-    v.selection.bg_fill = p.accent_soft;
+    v.selection.bg_fill = p.selection;
     v.selection.stroke = egui::Stroke::new(1.0_f32, p.accent);
     v.hyperlink_color = p.accent;
     v.override_text_color = Some(p.text);
@@ -122,6 +122,7 @@ fn styled(dark: bool) -> Style {
     style.spacing.item_spacing = egui::vec2(8.0, 6.0);
     style.spacing.button_padding = egui::vec2(8.0, 4.0);
     style.spacing.menu_margin = Margin::same(6);
+    style.scroll_animation = egui::style::ScrollAnimation::none();
     style.text_styles = [
         (egui::TextStyle::Body, egui::FontId::proportional(15.0)),
         (egui::TextStyle::Button, egui::FontId::proportional(13.5)),

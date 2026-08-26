@@ -52,6 +52,13 @@ impl Preview {
     }
 }
 
+pub fn warmup() {
+    std::thread::spawn(|| {
+        let _ = SYNTAX.get_or_init(SyntaxSet::load_defaults_newlines);
+        let _ = THEMES.get_or_init(ThemeSet::load_defaults);
+    });
+}
+
 fn own_cow(c: pulldown_cmark::CowStr<'_>) -> pulldown_cmark::CowStr<'static> {
     match c {
         pulldown_cmark::CowStr::Boxed(s) => pulldown_cmark::CowStr::Boxed(s),
@@ -179,11 +186,28 @@ pub fn show(ui: &mut Ui, pv: &mut Preview, text: &str, base: Option<&Path>, dark
     let evs = pv.events_for(version, text);
     let mut cfg = Cfg { base, dark, pv, depth: 0, block_no: 0 };
     let top = ui.cursor().top();
-    let mut i = 0usize;
-    let mut first = true;
-    while i < evs.len() {
-        blocks_until(ui, &mut cfg, &evs, &mut i, None, &mut first);
-    }
+
+    ui.add_space(12.0);
+    let outer_avail = ui.available_width();
+    const GUTTER: f32 = 28.0;
+    const MAX_CONTENT_W: f32 = 760.0;
+    let content_w = (outer_avail - GUTTER * 2.0).clamp(140.0, MAX_CONTENT_W);
+    let side = ((outer_avail - content_w) * 0.5).max(GUTTER);
+
+    ui.vertical(|ui| {
+        ui.horizontal(|ui| {
+            ui.add_space(side);
+            ui.vertical(|ui| {
+                ui.set_max_width(content_w - ui.style().spacing.item_spacing.x);
+                let mut i = 0usize;
+                let mut first = true;
+                while i < evs.len() {
+                    blocks_until(ui, &mut cfg, &evs, &mut i, None, &mut first);
+                }
+            });
+        });
+    });
+
     cfg.pv.content_height = ui.cursor().bottom() - top + 40.0;
 }
 
@@ -269,10 +293,52 @@ fn render_block(ui: &mut Ui, cfg: &mut Cfg, evs: &[Event], i: &mut usize, first:
             hr(ui);
             *first = false;
         }
-        Event::Start(Tag::FootnoteDefinition(_)) => {
-            let tag = evs[*i].clone_event_tag();
-            skip_through(evs, i, &tag);
+        Event::Start(Tag::FootnoteDefinition(name)) => {
+            *i += 1;
+            gap(ui, *first, 6.0);
+            footnote_def(ui, cfg, evs, i, name);
             *first = false;
+        }
+        Event::Start(Tag::HtmlBlock) => {
+            *i += 1;
+            let mut raw = String::new();
+            loop {
+                match evs.get(*i) {
+                    Some(Event::Html(h)) => {
+                        raw.push_str(h);
+                        *i += 1;
+                    }
+                    Some(Event::End(e)) if closes(&Tag::HtmlBlock, e) => {
+                        *i += 1;
+                        break;
+                    }
+                    None => break,
+                    _ => *i += 1,
+                }
+            }
+            if !raw.trim().is_empty() {
+                gap(ui, *first, 8.0);
+                html_block(ui, &raw, theme::palette(cfg.dark));
+                *first = false;
+            }
+        }
+        Event::Text(t) => {
+            let t = t.to_string();
+            gap(ui, *first, 9.0);
+            let mut st = InlineSt::new(ui.available_width(), theme::palette(cfg.dark));
+            st.push(&t);
+            add_inline(ui, st);
+            *first = false;
+            *i += 1;
+        }
+        Event::Code(c) => {
+            let c = c.to_string();
+            gap(ui, *first, 9.0);
+            let mut st = InlineSt::new(ui.available_width(), theme::palette(cfg.dark));
+            st.push_code(&c);
+            add_inline(ui, st);
+            *first = false;
+            *i += 1;
         }
         _ => {
             *i += 1;
@@ -280,10 +346,62 @@ fn render_block(ui: &mut Ui, cfg: &mut Cfg, evs: &[Event], i: &mut usize, first:
     }
 }
 
-#[derive(Clone, Copy)]
+fn footnote_def(ui: &mut Ui, cfg: &mut Cfg, evs: &[Event], i: &mut usize, name: &pulldown_cmark::CowStr) {
+    let pal = theme::palette(cfg.dark);
+    let mut body = String::new();
+    while *i < evs.len() {
+        match &evs[*i] {
+            Event::Text(t) => body.push_str(t),
+            Event::Code(c) => body.push_str(c),
+            Event::SoftBreak => body.push(' '),
+            Event::End(e) if closes(&Tag::FootnoteDefinition(name.clone()), e) => {
+                *i += 1;
+                break;
+            }
+            _ => {}
+        }
+        *i += 1;
+    }
+    ui.horizontal_top(|ui| {
+        ui.label(
+            eframe::egui::RichText::new(format!("^{name}"))
+                .font(FontId::monospace(12.5))
+                .color(pal.weak),
+        );
+        ui.vertical(|ui| {
+            let mut st = InlineSt::new(ui.available_width(), pal);
+            st.weak_text = true;
+            st.head_size = Some(13.0);
+            st.push(body.trim());
+            add_inline(ui, st);
+        });
+    });
+}
+
+fn html_block(ui: &mut Ui, raw: &str, pal: theme::Palette) {
+    egui::Frame::default()
+        .fill(pal.faint_fill)
+        .stroke(Stroke::new(1.0_f32, pal.stroke))
+        .corner_radius(3)
+        .inner_margin(Margin::same(9))
+        .show(ui, |ui| {
+            ui.set_max_width(ui.available_width());
+            ui.add(
+                Label::new(
+                    eframe::egui::RichText::new(raw.trim())
+                        .font(FontId::monospace(12.5))
+                        .color(pal.weak),
+                )
+                .wrap(),
+            );
+        });
+}
+
+#[derive(Clone, Copy, PartialEq)]
 enum Stop {
     Para,
     Head,
+    Item,
 }
 
 fn inline_stop(stop: Stop, e: &pulldown_cmark::TagEnd) -> bool {
@@ -291,7 +409,22 @@ fn inline_stop(stop: Stop, e: &pulldown_cmark::TagEnd) -> bool {
     match stop {
         Stop::Para => matches!(e, E::Paragraph),
         Stop::Head => matches!(e, E::Heading(_)),
+        Stop::Item => matches!(e, E::Item),
     }
+}
+
+fn is_block_start(t: &Tag) -> bool {
+    matches!(
+        t,
+        Tag::List(_)
+            | Tag::Item
+            | Tag::CodeBlock(_)
+            | Tag::HtmlBlock
+            | Tag::Table(_)
+            | Tag::BlockQuote(_)
+            | Tag::FootnoteDefinition(_)
+            | Tag::Heading { .. }
+    )
 }
 
 struct InlineSt<'a> {
@@ -300,6 +433,7 @@ struct InlineSt<'a> {
     strong: u32,
     strike: u32,
     link: Option<String>,
+    links: Vec<(std::ops::Range<usize>, String)>,
     head_size: Option<f32>,
     weak_text: bool,
     pal: theme::Palette,
@@ -309,18 +443,27 @@ struct InlineSt<'a> {
 impl<'a> InlineSt<'a> {
     fn new(width: f32, pal: theme::Palette) -> Self {
         let mut job = LayoutJob::default();
-        job.wrap.max_width = width;
+        job.wrap.max_width = if width.is_finite() && width > 40.0 { width } else { 480.0 };
+        job.wrap.break_anywhere = true;
         InlineSt {
             job,
             italics: 0,
             strong: 0,
             strike: 0,
             link: None,
+            links: Vec::new(),
             head_size: None,
             weak_text: false,
             pal,
             _p: std::marker::PhantomData,
         }
+    }
+
+    fn link_at(&self, byte: usize) -> Option<&str> {
+        self.links
+            .iter()
+            .find(|(r, _)| r.contains(&byte))
+            .map(|(_, u)| u.as_str())
     }
 
     fn push(&mut self, text: &str) {
@@ -342,6 +485,7 @@ impl<'a> InlineSt<'a> {
         } else {
             self.pal.text
         };
+        let start = self.job.text.len();
         self.job.append(
             text, 0.0,
             TextFormat {
@@ -362,6 +506,9 @@ impl<'a> InlineSt<'a> {
                 ..Default::default()
             },
         );
+        if let Some(url) = self.link.clone() {
+            self.links.push((start..self.job.text.len(), url));
+        }
     }
 
     fn push_code(&mut self, text: &str) {
@@ -379,8 +526,15 @@ impl<'a> InlineSt<'a> {
 }
 
 fn inline_until(cfg: &Cfg, evs: &[Event], i: &mut usize, stop: Stop, st: &mut InlineSt) {
+    use pulldown_cmark::TagEnd as E;
     while *i < evs.len() {
         match &evs[*i] {
+            Event::End(e) if stop == Stop::Item && matches!(e, E::Paragraph | E::Item) => {
+                return;
+            }
+            Event::Start(t) if stop == Stop::Item && is_block_start(t) => {
+                return;
+            }
             Event::End(e) if inline_stop(stop, e) => {
                 *i += 1;
                 return;
@@ -406,6 +560,11 @@ fn inline_until(cfg: &Cfg, evs: &[Event], i: &mut usize, stop: Stop, st: &mut In
                 st.weak_text = true;
                 st.push(format!("[{}]", n).as_str());
                 st.weak_text = save_weak;
+                *i += 1;
+            }
+            Event::InlineMath(c) | Event::DisplayMath(c) => {
+                let c = c.to_string();
+                st.push_code(&c);
                 *i += 1;
             }
             Event::Start(Tag::Emphasis) => {
@@ -491,6 +650,8 @@ fn render_inline_image(st: &mut InlineSt, dest: &str, alt: &str, cfg: &Cfg) {
     };
     let hint = if resolve_local(cfg.base, dest).is_some() {
         label
+    } else if let Some(rest) = dest.strip_prefix("https://") {
+        format!("{label} ({})", rest.split('/').next().unwrap_or(dest))
     } else {
         format!("{label} ({dest})")
     };
@@ -498,6 +659,53 @@ fn render_inline_image(st: &mut InlineSt, dest: &str, alt: &str, cfg: &Cfg) {
     st.link = Some(String::new());
     st.push(&format!("[{hint}]"));
     st.link = save;
+}
+
+fn add_inline(ui: &mut Ui, mut st: InlineSt) {
+    if st.links.is_empty() {
+        ui.add(Label::new(st.job).selectable(true));
+        return;
+    }
+    let job = std::mem::take(&mut st.job);
+    let galley = ui.painter().layout_job(job);
+    let (rect, resp) = ui.allocate_exact_size(galley.size(), Sense::click());
+    ui.painter().galley(rect.min, galley.clone(), Color32::TRANSPARENT);
+    let mut clicked_url: Option<String> = None;
+    if let Some(pos) = resp.hover_pos() {
+        if rect.contains(pos) {
+            let byte = galley.cursor_from_pos(pos - rect.min).ccursor.index;
+            if st.link_at(byte).is_some() {
+                resp.clone().on_hover_cursor(egui::CursorIcon::PointingHand);
+            }
+        }
+    }
+    if resp.clicked() {
+        if let Some(pos) = resp.interact_pointer_pos() {
+            if rect.contains(pos) {
+                let byte = galley.cursor_from_pos(pos - rect.min).ccursor.index;
+                if let Some(url) = st.link_at(byte) {
+                    clicked_url = Some(url.to_string());
+                }
+            }
+        }
+    }
+    if let Some(url) = clicked_url {
+        open_link(ui, &url);
+    }
+}
+
+fn open_link(ui: &Ui, url: &str) {
+    let url = url.trim();
+    if url.is_empty() {
+        return;
+    }
+    if url.starts_with('#') {
+        return;
+    }
+    ui.ctx().output_mut(|o| {
+        o.commands
+            .push(eframe::egui::OutputCommand::OpenUrl(eframe::egui::OpenUrl::new_tab(url.to_string())))
+    });
 }
 
 fn resolve_local(base: Option<&Path>, src: &str) -> Option<PathBuf> {
@@ -531,14 +739,15 @@ fn paragraph(ui: &mut Ui, cfg: &mut Cfg, evs: &[Event], i: &mut usize) {
             return;
         }
         let mut st = InlineSt::new(width, pal);
-        st.push(&format!("\u{fffd}{alt}"));
-        ui.add(Label::new(st.job));
+        render_inline_image(&mut st, &dest, &alt, cfg);
+        inline_until(cfg, evs, i, Stop::Para, &mut st);
+        add_inline(ui, st);
         return;
     }
 
     let mut st = InlineSt::new(width, pal);
     inline_until(cfg, evs, i, Stop::Para, &mut st);
-    ui.add(Label::new(st.job).selectable(true));
+    add_inline(ui, st);
 }
 
 fn heading(ui: &mut Ui, cfg: &mut Cfg, evs: &[Event], i: &mut usize, lvl: u8) {
@@ -548,7 +757,7 @@ fn heading(ui: &mut Ui, cfg: &mut Cfg, evs: &[Event], i: &mut usize, lvl: u8) {
     let mut st = InlineSt::new(ui.available_width(), pal);
     st.head_size = Some(size);
     inline_until(cfg, evs, i, Stop::Head, &mut st);
-    ui.add(Label::new(st.job).selectable(true));
+    add_inline(ui, st);
     if lvl <= 2 {
         ui.add_space(4.0);
         let w = ui.available_width();
@@ -691,7 +900,9 @@ fn code_block(ui: &mut Ui, cfg: &mut Cfg, evs: &[Event], i: &mut usize, lang: Op
         .stroke(Stroke::new(1.0_f32, pal.stroke.gamma_multiply(0.6)));
     let rr = frame.show(ui, |ui| {
         let mut job = LayoutJob::default();
-        job.wrap.max_width = ui.available_width();
+        let w = ui.available_width();
+        job.wrap.max_width = if w.is_finite() && w > 40.0 { w } else { 480.0 };
+        job.wrap.break_anywhere = true;
         let mono = FontId::monospace(13.0);
         let n = lines.len();
         for (idx, row) in lines.iter().enumerate() {
@@ -821,52 +1032,133 @@ fn table(
     }
 
     let ncols = aligns.len().max(header.len()).max(rows.iter().map(|r| r.len()).max().unwrap_or(0)).max(1);
-    cfg.block_no += 1;
-    let gid = Id::new(("lihati-table", cfg.block_no));
     let pal = theme::palette(cfg.dark);
+    let header_font = FontId::new(14.2, theme::family_bold());
+    let body_font = FontId::proportional(BODY - 0.5);
+    const PAD_X: f32 = 16.0;
+    const PAD_Y: f32 = 5.0;
 
-    egui::Grid::new(gid)
-        .striped(true)
-        .num_columns(ncols)
-        .min_col_width(28.0)
-        .spacing([20.0, 7.0])
-        .show(ui, |ui| {
-            for col in 0..ncols {
-                let text = header.get(col).cloned().unwrap_or_default();
-                let rt = eframe::egui::RichText::new(text)
-                    .font(FontId::new(14.2, theme::family_bold()))
-                    .color(pal.text);
-                with_align(ui, aligns.get(col), |ui| {
-                    ui.label(rt);
-                });
-            }
-            ui.end_row();
+    let layout_cell_galley = |ui: &Ui, text: &str, w: f32, font: &FontId, align: Option<&pulldown_cmark::Alignment>| -> (Arc<egui::Galley>, f32) {
+        use pulldown_cmark::Alignment;
+        let wrap_w = (w - PAD_X).max(28.0);
+        let mut job = LayoutJob::default();
+        job.wrap.max_width = wrap_w;
+        job.wrap.break_anywhere = true;
+        job.append(text, 0.0, TextFormat::simple(font.clone(), pal.text));
+        let g = ui.painter().layout_job(job);
+        let x_off = match align {
+            Some(Alignment::Right) => (wrap_w - g.size().x).max(0.0),
+            Some(Alignment::Center) => ((wrap_w - g.size().x) * 0.5).max(0.0),
+            _ => 0.0,
+        };
+        (g, x_off)
+    };
+
+    let natural: Vec<f32> = (0..ncols)
+        .map(|col| {
+            let mut w = ui
+                .ctx()
+                .fonts(|f| {
+                    f.layout_no_wrap(
+                        header.get(col).cloned().unwrap_or_default(),
+                        header_font.clone(),
+                        pal.text,
+                    )
+                })
+                .size()
+                .x;
             for row in &rows {
-                for col in 0..ncols {
-                    let text = row.get(col).cloned().unwrap_or_default();
-                    let rt =
-                        eframe::egui::RichText::new(text).size(BODY - 0.5).color(pal.text);
-                    with_align(ui, aligns.get(col), |ui| {
-                        ui.label(rt);
-                    });
-                }
-                ui.end_row();
+                w = w.max(
+                    ui.ctx()
+                        .fonts(|f| {
+                            f.layout_no_wrap(
+                                row.get(col).cloned().unwrap_or_default(),
+                                body_font.clone(),
+                                pal.text,
+                            )
+                        })
+                        .size()
+                        .x,
+                );
             }
-        });
+            w + PAD_X
+        })
+        .collect();
+
+    let avail = ui.available_width().max(160.0);
+    let total: f32 = natural.iter().sum();
+    let widths: Vec<f32> = if total > avail {
+        let scale = (avail / total).max(0.08);
+        natural.iter().map(|w| (*w * scale).max(48.0)).collect()
+    } else {
+        natural
+    };
+
+    let row_w: f32 = widths.iter().sum::<f32>().min(avail);
+
+    let paint_row = |ui: &mut Ui, cells: &[String], font: &FontId, header_row: bool| -> f32 {
+        let galleys: Vec<(Arc<egui::Galley>, f32)> = (0..ncols)
+            .map(|col| {
+                layout_cell_galley(
+                    ui,
+                    cells.get(col).map(String::as_str).unwrap_or(""),
+                    widths[col],
+                    font,
+                    aligns.get(col),
+                )
+            })
+            .collect();
+        let row_h = galleys
+            .iter()
+            .map(|(g, _)| g.size().y)
+            .fold(0.0_f32, f32::max)
+            + PAD_Y * 2.0;
+
+        let y_top = ui.cursor().top();
+        let x_left = ui.cursor().left();
+        for (col, (g, x_off)) in galleys.iter().enumerate() {
+            let cell_x = x_left + widths[..col].iter().sum::<f32>();
+            let y_text = y_top + PAD_Y + if header_row { 1.0 } else { 0.0 };
+            ui.painter().galley(
+                egui::pos2(cell_x + PAD_X * 0.5 + x_off, y_text),
+                g.clone(),
+                Color32::TRANSPARENT,
+            );
+        }
+        ui.allocate_exact_size(Vec2::new(row_w, row_h), Sense::hover());
+        row_h
+    };
+
+    ui.vertical(|ui| {
+        paint_row(ui, &header, &header_font, true);
+        rule_line(ui, row_w, pal.stroke);
+
+        for (ri, row) in rows.iter().enumerate() {
+            paint_row(ui, row, &body_font, false);
+            if ri + 1 < rows.len() {
+                rule_line(ui, row_w, pal.stroke.gamma_multiply(0.4));
+            }
+        }
+    });
     ui.add_space(6.0);
 }
 
-fn with_align(ui: &mut Ui, align: Option<&pulldown_cmark::Alignment>, add: impl FnOnce(&mut Ui)) {
-    use pulldown_cmark::Alignment;
-    match align {
-        Some(Alignment::Center) => ui.with_layout(eframe::egui::Layout::centered_and_justified(
-            eframe::egui::Direction::TopDown,
-        ), add),
-        Some(Alignment::Right) => {
-            ui.with_layout(eframe::egui::Layout::right_to_left(eframe::egui::Align::Center), add)
+fn rule_line(ui: &mut Ui, w: f32, color: Color32) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(w.min(ui.available_width()), 1.0), Sense::hover());
+    ui.painter().line_segment(
+        [egui::pos2(rect.left(), rect.center().y), egui::pos2(rect.left() + rect.width(), rect.center().y)],
+        Stroke::new(1.0_f32, color),
+    );
+}
+
+fn flush_inline(ui: &mut Ui, st: &mut Option<InlineSt>, first: &mut bool) {
+    if let Some(s) = st.take() {
+        if !s.job.text.is_empty() {
+            gap(ui, *first, 4.0);
+            add_inline(ui, s);
+            *first = false;
         }
-        _ => ui.with_layout(eframe::egui::Layout::left_to_right(eframe::egui::Align::Center), add),
-    };
+    }
 }
 
 fn list(
@@ -923,11 +1215,42 @@ fn list(
                             },
                         );
                     }
-                    let mut inner_first = true;
-                    blocks_until(ui, cfg, evs, i, Some(&Tag::Item), &mut inner_first);
-                    if !inner_first {
-                        ui.add_space(2.0);
-                    }
+                    ui.vertical(|ui| {
+                        let mut first = true;
+                        let mut st: Option<InlineSt> = None;
+                        while *i < evs.len() {
+                            match &evs[*i] {
+                                Event::End(e) if closes(&Tag::Item, e) => {
+                                    *i += 1;
+                                    break;
+                                }
+                                Event::End(e) if closes(&Tag::Paragraph, e) => {
+                                    flush_inline(ui, &mut st, &mut first);
+                                    *i += 1;
+                                }
+                                Event::Start(t) if is_block_start(t) => {
+                                    flush_inline(ui, &mut st, &mut first);
+                                    render_block(ui, cfg, evs, i, &mut first);
+                                }
+                                _ => {
+                                    if st.is_none() {
+                                        st = Some(InlineSt::new(
+                                            ui.available_width(),
+                                            theme::palette(cfg.dark),
+                                        ));
+                                    }
+                                    inline_until(
+                                        cfg,
+                                        evs,
+                                        i,
+                                        Stop::Item,
+                                        st.as_mut().unwrap(),
+                                    );
+                                }
+                            }
+                        }
+                        flush_inline(ui, &mut st, &mut first);
+                    });
                 });
                 ui.add_space(2.0);
             }
