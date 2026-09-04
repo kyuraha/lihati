@@ -13,7 +13,7 @@ highlighting for code blocks via [syntect](https://github.com/trishume/syntect).
 
 - **Three-panel workspace**: directory browser, editor, outline — each panel can be hidden
   independently for a distraction-free writing mode.
-- **Source / Split / Preview** toggle (Ctrl+E cycles Source ↔ Preview).
+- **Source / Preview** toggle (Ctrl+E switches between them).
   - Live preview renders headings, lists, task checkboxes, tables, blockquotes,
     code blocks (syntax highlighted), links, images, horizontal rules.
   - Local images are resolved relative to the document; remote images show a placeholder.

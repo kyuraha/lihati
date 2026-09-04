@@ -42,12 +42,27 @@ struct Find {
     last_query: String,
 }
 
+/// Scroll memory per view (pixels): offset, content height, viewport height.
+#[derive(Clone, Copy, Default)]
+struct ViewScroll {
+    offset: f32,
+    content: f32,
+    viewport: f32,
+}
+
 pub struct App {
     state: PersistState,
     doc: Document,
     root: Option<PathBuf>,
     expanded: HashSet<PathBuf>,
     outline_collapsed: HashSet<usize>,
+    files_filter: String,
+    outline_filter: String,
+    active_outline: Option<usize>,
+    src_scroll: ViewScroll,
+    prev_scroll: ViewScroll,
+    last_view: ViewMode,
+    scroll_override: Option<f32>,
     dir_cache: HashMap<PathBuf, (Instant, Arc<Vec<Entry>>)>,
     preview: preview::Preview,
     toasts: Vec<Toast>,
@@ -78,12 +93,20 @@ impl App {
         theme::set_pref(&cc.egui_ctx, state.theme);
 
         let now = Instant::now();
+        let last_view = state.view;
         let mut app = App {
             state,
             doc: Document::new(),
             root: None,
             expanded: HashSet::new(),
             outline_collapsed: HashSet::new(),
+            files_filter: String::new(),
+            outline_filter: String::new(),
+            active_outline: None,
+            src_scroll: ViewScroll::default(),
+            prev_scroll: ViewScroll::default(),
+            last_view,
+            scroll_override: None,
             dir_cache: HashMap::new(),
             preview: preview::Preview::new(),
             toasts: Vec::new(),
@@ -228,6 +251,7 @@ impl App {
                 self.conflict_disk_text = None;
                 self.vanished_banner = false;
                 self.jump = None;
+                self.active_outline = None;
                 self.note_large_file();
                 self.ensure_root_for_current();
                 self.state.last_file = Some(path.to_string_lossy().to_string());
@@ -249,6 +273,7 @@ impl App {
         self.conflict_disk_text = None;
         self.vanished_banner = false;
         self.jump = None;
+        self.active_outline = None;
     }
 
     fn save_current(&mut self) {
@@ -404,9 +429,8 @@ impl App {
 
     fn cycle_theme(&mut self, ctx: &egui::Context) {
         self.state.theme = match self.state.theme {
-            ThemePref::System => ThemePref::Light,
             ThemePref::Light => ThemePref::Dark,
-            ThemePref::Dark => ThemePref::System,
+            ThemePref::Dark => ThemePref::Light,
         };
         theme::set_pref(ctx, self.state.theme);
     }
@@ -414,31 +438,55 @@ impl App {
     fn draw_toolbar(&mut self, ctx: &egui::Context) {
         let pal = self.pal();
         TopBottomPanel::top("toolbar")
-            .frame(Frame::default().fill(pal.panel).inner_margin(Margin::symmetric(8, 4)))
+            .frame(Frame::default().fill(pal.panel).inner_margin(Margin::symmetric(10, 5)))
             .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    if toggle_btn(ui, "Files", self.state.show_dir, &pal).clicked() {
-                        self.state.show_dir = !self.state.show_dir;
-                    }
-                    ui.separator();
-                    if small_btn(ui, "Open").on_hover_text("Open a Markdown file (Ctrl+O)").clicked() {
-                        self.open_dialog();
-                    }
-                    if small_btn(ui, "Save").on_hover_text("Save (Ctrl+S)").clicked() {
-                        self.save_current();
-                    }
-                    if small_btn(ui, "Save As").on_hover_text("Save as new file (Ctrl+Shift+S)").clicked() {
-                        self.save_as_dialog();
-                    }
-                    ui.separator();
-
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                // One spacing language for every control in the header.
+                ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
+                ui.spacing_mut().button_padding = egui::vec2(10.0, 4.0);
+                ui.columns(3, |cols| {
+                    // ---- left: panels + file actions ----
+                    cols[0].with_layout(Layout::left_to_right(Align::Center), |ui| {
+                        if toggle_btn(ui, "Files", self.state.show_dir, &pal).clicked() {
+                            self.state.show_dir = !self.state.show_dir;
+                        }
+                        ui.separator();
+                        if small_btn(ui, "Open").on_hover_text("Open a Markdown file (Ctrl+O)").clicked() {
+                            self.open_dialog();
+                        }
+                        if small_btn(ui, "Save").on_hover_text("Save (Ctrl+S)").clicked() {
+                            self.save_current();
+                        }
+                        if small_btn(ui, "Save As").on_hover_text("Save as new file (Ctrl+Shift+S)").clicked() {
+                            self.save_as_dialog();
+                        }
+                    });
+                    // ---- center: document title, centered on the window ----
+                    cols[1].centered_and_justified(|ui| {
+                        let name = self.doc.file_name();
+                        let dot = if self.doc.dirty { "\u{25cf} " } else { "" };
+                        let tip = self
+                            .doc
+                            .path
+                            .as_ref()
+                            .map(|p| p.to_string_lossy().to_string())
+                            .unwrap_or_else(|| "Unsaved document".to_string());
+                        ui.add(
+                            Label::new(
+                                RichText::new(format!("{}{}", dot, name))
+                                    .size(13.0)
+                                    .color(if self.doc.dirty { pal.warn } else { pal.text }),
+                            )
+                            .truncate(),
+                        )
+                        .on_hover_text(tip)
+                    });
+                    // ---- right: view + theme + outline ----
+                    cols[2].with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if toggle_btn(ui, "Outline", self.state.show_outline, &pal).clicked() {
                             self.state.show_outline = !self.state.show_outline;
                         }
                         ui.separator();
                         let theme_label = match self.state.theme {
-                            ThemePref::System => "Theme: System",
                             ThemePref::Light => "Theme: Light",
                             ThemePref::Dark => "Theme: Dark",
                         };
@@ -448,17 +496,6 @@ impl App {
                         if let Some(m) = segmented_view(ui, self.state.view, self.cur_dark, &pal) {
                             self.state.view = m;
                         }
-                        let name = self.doc.file_name();
-                        let dot = if self.doc.dirty { "\u{25cf} " } else { "" };
-                        ui.add_sized(
-                            [ui.available_width().min(380.0), 18.0],
-                            Label::new(
-                                RichText::new(format!("{}{}", dot, name))
-                                    .size(13.0)
-                                    .color(if self.doc.dirty { pal.warn } else { pal.weak }),
-                            )
-                            .truncate(),
-                        );
                     });
                 });
             });
@@ -484,40 +521,115 @@ impl App {
         let pal = self.pal();
         egui::SidePanel::left("files-panel")
             .resizable(true)
-            .default_width(220.0)
-            .width_range(150.0..=400.0)
+            .default_width(240.0)
+            .width_range(170.0..=420.0)
+            .frame(
+                Frame::default()
+                    .fill(pal.panel)
+                    .stroke(egui::Stroke::new(1.0_f32, pal.stroke))
+                    .inner_margin(Margin::symmetric(8, 6)),
+            )
             .show(ctx, |ui| {
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
+                // ---- vault card ----
+                if let Some(root) = self.root.clone() {
+                    let name = root
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("Notes")
+                        .to_string();
+                    vault_card(ui, &pal, &name, &root.to_string_lossy());
                     ui.add_space(4.0);
-                    ui.label(RichText::new("FILES").size(11.0).color(pal.weak));
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if ui
-                            .add(Button::new(RichText::new("\u{00ab}").size(12.0)))
-                            .on_hover_text("Hide files panel")
-                            .clicked()
-                        {
-                            self.state.show_dir = false;
-                        }
-                        if ui
-                            .add(Button::new(RichText::new("\u{2026}").size(12.0)))
-                            .on_hover_text("Choose folder\u{2026}")
-                            .clicked()
-                        {
-                            self.choose_root();
-                        }
-                    });
+                }
+
+                // ---- search ----
+                ui.horizontal(|ui| {
+                    let clear_w = if self.files_filter.is_empty() { 0.0 } else { 26.0 };
+                    let w = (ui.available_width() - clear_w).max(40.0);
+                    ui.add_sized(
+                        [w, 24.0],
+                        TextEdit::singleline(&mut self.files_filter)
+                            .hint_text("Search files\u{2026}"),
+                    );
+                    if !self.files_filter.is_empty()
+                        && small_btn(ui, "\u{00d7}").on_hover_text("Clear search").clicked()
+                    {
+                        self.files_filter.clear();
+                    }
                 });
+                ui.add_space(2.0);
                 ui.separator();
+
+                // ---- tree ----
+                if !self.files_filter.trim().is_empty() {
+                    let q = self.files_filter.trim().to_lowercase();
+                    let mut hits: Vec<PathBuf> = Vec::new();
+                    if let Some(root) = self.root.clone() {
+                        collect_md(&root, &mut hits, 800, 0);
+                    }
+                    hits.retain(|p| {
+                        p.file_name()
+                            .map(|n| n.to_string_lossy().to_lowercase().contains(q.as_str()))
+                            .unwrap_or(false)
+                    });
+                    hits.sort();
+                    ScrollArea::vertical()
+                        .id_salt("files-search-scroll")
+                        .auto_shrink(false)
+                        .show(ui, |ui| {
+                            ui.spacing_mut().item_spacing.y = 1.0;
+                            if hits.is_empty() {
+                                tree_empty(ui, &pal, "No matching notes");
+                            } else {
+                                for p in hits {
+                                    let name = p
+                                        .file_name()
+                                        .map(|n| n.to_string_lossy().to_string())
+                                        .unwrap_or_default();
+                                    let selected =
+                                        self.doc.path.as_deref() == Some(p.as_path());
+                                    let dirty = selected && self.doc.dirty;
+                                    if file_row(ui, &pal, 0, selected, dirty, &name, &p.to_string_lossy())
+                                    {
+                                        self.open_path(p);
+                                    }
+                                }
+                            }
+                        });
+                    return;
+                }
 
                 match self.root.clone() {
                     Some(root) if root.is_dir() => {
-                        ScrollArea::vertical()
-                            .id_salt("files-scroll")
-                            .auto_shrink(false)
-                            .show(ui, |ui| {
-                                self.draw_dir_entries(ui, &root, 0);
+                        let entries = self.entries_for(&root);
+                        if entries.is_empty() {
+                            tree_empty(ui, &pal, "No notes yet");
+                            ui.add_space(2.0);
+                            ui.vertical_centered(|ui| {
+                                ui.label(
+                                    RichText::new("Markdown files will appear here")
+                                        .size(11.0)
+                                        .color(pal.weak),
+                                );
                             });
+                        } else {
+                            ScrollArea::vertical()
+                                .id_salt("files-scroll")
+                                .auto_shrink(false)
+                                .show(ui, |ui| {
+                                    ui.spacing_mut().item_spacing.y = 1.0;
+                                    self.draw_dir_entries(ui, &root, 0);
+                                });
+                        }
+                        let (d, f) = dir_counts(&self.entries_for(&root));
+                        ui.separator();
+                        ui.label(
+                            RichText::new(format!(
+                                "{} folders \u{00b7} {} notes",
+                                d, f
+                            ))
+                            .size(11.0)
+                            .color(pal.weak),
+                        );
                     }
                     Some(_) => {
                         ui.add_space(20.0);
@@ -550,19 +662,8 @@ impl App {
         for e in entries.iter() {
             if e.is_dir {
                 let expanded = self.expanded.contains(&e.path);
-                let mut toggle = false;
-                ui.horizontal(|ui| {
-                    ui.add_space(depth as f32 * 11.0 + 2.0);
-                    if draw_caret(ui, expanded).clicked() {
-                        toggle = true;
-                    }
-                    let name_resp =
-                        ui.selectable_label(false, RichText::new(e.name.clone()).size(13.0));
-                    if name_resp.clicked() {
-                        toggle = true;
-                    }
-                });
-                if toggle {
+                let tip = e.path.to_string_lossy().to_string();
+                if folder_row(ui, &self.pal(), depth, expanded, &e.name, &tip).clicked() {
                     if expanded {
                         self.expanded.remove(&e.path);
                     } else {
@@ -574,17 +675,12 @@ impl App {
                 }
             } else {
                 let selected = self.doc.path.as_deref() == Some(e.path.as_path());
-                let path = e.path.clone();
-                ui.horizontal(|ui| {
-                    ui.add_space(depth as f32 * 11.0 + 16.0);
-                    let mut label = RichText::new(e.name.clone()).size(13.0);
-                    if selected {
-                        label = label.color(theme::palette(ui.visuals().dark_mode).accent);
-                    }
-                    if ui.selectable_label(selected, label).clicked() {
-                        self.open_path(path);
-                    }
-                });
+                let dirty = selected && self.doc.dirty;
+                let tip = e.path.to_string_lossy().to_string();
+                if file_row(ui, &self.pal(), depth, selected, dirty, &e.name, &tip) {
+                    let path = e.path.clone();
+                    self.open_path(path);
+                }
             }
         }
     }
@@ -633,26 +729,31 @@ impl App {
                     return;
                 }
 
+                // Keep the reading position across Source/Preview switches:
+                // map the old view's scroll fraction onto the new view.
+                if self.state.view != self.last_view {
+                    let (from, to) = if self.last_view == ViewMode::Source {
+                        (self.src_scroll, self.prev_scroll)
+                    } else {
+                        (self.prev_scroll, self.src_scroll)
+                    };
+                    let frac = (from.offset / (from.content - from.viewport).max(1.0))
+                        .clamp(0.0, 1.0);
+                    self.scroll_override =
+                        Some(frac * (to.content - to.viewport).max(0.0));
+                }
+                self.last_view = self.state.view;
+
                 match self.state.view {
                     ViewMode::Source => {
-                        let Self { doc, jump, editor_pitch, .. } = self;
-                        editor_pane(ui, doc, jump, editor_pitch);
-                    }
-                    ViewMode::Split => {
-                        ui.columns(2, |cols| {
-                            {
-                                let Self { doc, jump, editor_pitch, .. } = self;
-                                editor_pane(&mut cols[0], doc, jump, editor_pitch);
-                            }
-                            {
-                                let Self { doc, preview, cur_dark, .. } = self;
-                                preview_pane(&mut cols[1], doc, preview, *cur_dark);
-                            }
-                        });
+                        let ov = self.scroll_override.take();
+                        let Self { doc, jump, editor_pitch, src_scroll, .. } = self;
+                        *src_scroll = editor_pane(ui, doc, jump, editor_pitch, ov);
                     }
                     ViewMode::Preview => {
-                        let Self { doc, preview, cur_dark, .. } = self;
-                        preview_pane(ui, doc, preview, *cur_dark);
+                        let ov = self.scroll_override.take();
+                        let Self { doc, preview, cur_dark, prev_scroll, .. } = self;
+                        *prev_scroll = preview_pane(ui, doc, preview, *cur_dark, ov);
                     }
                 }
             });
@@ -662,41 +763,72 @@ impl App {
         let pal = self.pal();
         egui::SidePanel::right("outline-panel")
             .resizable(true)
-            .default_width(230.0)
-            .width_range(160.0..=420.0)
+            .default_width(250.0)
+            .width_range(170.0..=420.0)
+            .frame(
+                Frame::default()
+                    .fill(pal.panel)
+                    .stroke(egui::Stroke::new(1.0_f32, pal.stroke))
+                    .inner_margin(Margin::symmetric(8, 6)),
+            )
             .show(ctx, |ui| {
-                ui.add_space(6.0);
+                // ---- search ----
                 ui.horizontal(|ui| {
-                    ui.add_space(4.0);
-                    ui.label(RichText::new("OUTLINE").size(11.0).color(pal.weak));
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if ui
-                            .add(Button::new(RichText::new("\u{00bb}").size(12.0)))
-                            .on_hover_text("Hide outline")
-                            .clicked()
-                        {
-                            self.state.show_outline = false;
-                        }
-                    });
+                    let clear_w = if self.outline_filter.is_empty() { 0.0 } else { 26.0 };
+                    let w = (ui.available_width() - clear_w).max(40.0);
+                    ui.add_sized(
+                        [w, 24.0],
+                        TextEdit::singleline(&mut self.outline_filter)
+                            .hint_text("Search outline\u{2026}"),
+                    );
+                    if !self.outline_filter.is_empty()
+                        && small_btn(ui, "\u{00d7}").on_hover_text("Clear search").clicked()
+                    {
+                        self.outline_filter.clear();
+                    }
                 });
                 ui.add_space(2.0);
                 ui.separator();
 
+                // ---- list ----
+                let q = self.outline_filter.trim().to_lowercase();
+                let filtering = !q.is_empty();
                 let headings = self.headings.clone();
+                let shown: Vec<(usize, Heading)> = headings
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, h)| {
+                        filtering && h.title.to_lowercase().contains(q.as_str()) || !filtering
+                    })
+                    .map(|(i, h)| (i, h.clone()))
+                    .collect();
+
                 ScrollArea::vertical()
                     .id_salt("outline-scroll")
                     .auto_shrink(false)
                     .show(ui, |ui| {
+                        ui.spacing_mut().item_spacing.y = 1.0;
                         if headings.is_empty() {
-                            ui.add_space(16.0);
+                            tree_empty(ui, &pal, "No headings yet");
+                            ui.add_space(2.0);
                             ui.vertical_centered(|ui| {
-                                ui.label(RichText::new("No headings yet").weak().size(12.5));
+                                ui.label(
+                                    RichText::new("Use # headings to build an outline")
+                                        .size(11.0)
+                                        .color(pal.weak),
+                                );
                             });
                             return;
                         }
+                        if shown.is_empty() {
+                            tree_empty(ui, &pal, "No matching headings");
+                            return;
+                        }
 
+                        let min_lvl =
+                            shown.iter().map(|(_, h)| h.level).min().unwrap_or(1);
                         let mut open_ancestors: Vec<(u8, usize)> = Vec::new();
-                        for (idx, h) in headings.iter().enumerate() {
+                        for (pos, (_, h)) in shown.iter().enumerate() {
                             while let Some(&(lvl, _)) = open_ancestors.last() {
                                 if lvl >= h.level {
                                     open_ancestors.pop();
@@ -704,69 +836,119 @@ impl App {
                                     break;
                                 }
                             }
-                            let visible = open_ancestors
-                                .iter()
-                                .all(|(_, line)| !self.outline_collapsed.contains(line));
-                            let has_children = headings
-                                .get(idx + 1)
-                                .map(|n| n.level > h.level)
-                                .unwrap_or(false);
-
-                            if visible {
-                                let indent = ((h.level as i32 - 1).max(0)) as f32 * 12.0 + 4.0;
-                                let size = match h.level {
-                                    1 => 13.2,
-                                    2 => 12.8,
-                                    3 => 12.4,
-                                    _ => 12.0,
-                                };
-                                let text = if h.title.trim().is_empty() {
-                                    "(untitled)".to_string()
-                                } else {
-                                    h.title.clone()
-                                };
-                                let mut rt = RichText::new(text).size(size);
-                                rt = if h.level <= 2 {
-                                    rt.color(pal.text)
-                                } else {
-                                    rt.color(pal.weak)
-                                };
-                                if h.level == 1 {
-                                    rt = rt.font(eframe::egui::FontId::new(
-                                        size,
-                                        theme::family_bold(),
-                                    ));
+                            let visible = filtering
+                                || open_ancestors
+                                    .iter()
+                                    .all(|(_, line)| !self.outline_collapsed.contains(line));
+                            let has_children = !filtering
+                                && shown
+                                    .get(pos + 1)
+                                    .map(|(_, n)| n.level > h.level)
+                                    .unwrap_or(false);
+                            let open = !self.outline_collapsed.contains(&h.line);
+                            if !visible {
+                                // Push even when collapsed: descendants must still
+                                // see this ancestor to know they stay hidden.
+                                if has_children {
+                                    open_ancestors.push((h.level, h.line));
                                 }
-                                let line = h.line;
-                                ui.horizontal(|ui| {
-                                    ui.add_space(indent);
-                                    if has_children {
-                                        let is_open =
-                                            !self.outline_collapsed.contains(&line);
-                                        if draw_caret_small(ui, is_open).clicked() {
-                                            if is_open {
-                                                self.outline_collapsed.insert(line);
-                                            } else {
-                                                self.outline_collapsed.remove(&line);
-                                            }
-                                        }
-                                    } else {
-                                        ui.add_space(14.0);
-                                    }
-                                    if ui
-                                        .add(Button::new(rt).truncate())
-                                        .on_hover_text(format!("Go to line {}", line + 1))
-                                        .clicked()
-                                    {
-                                        self.jump = Some(line);
-                                        if self.state.view == ViewMode::Preview {
-                                            self.state.view = ViewMode::Source;
-                                        }
-                                    }
-                                });
+                                continue;
                             }
 
-                            if has_children && !self.outline_collapsed.contains(&h.line) {
+                            let depth =
+                                h.level.saturating_sub(min_lvl) as usize;
+                            let active = self.active_outline == Some(h.line);
+                            let (rect, resp) =
+                                tree_row_frame(ui, &pal, OUTLINE_ROW_H, active, true);
+                            paint_guides(ui, &pal, rect, depth, OUTLINE_STEP);
+                            let lx = level_x(rect, depth, OUTLINE_STEP);
+
+                            let mut caret_toggle = false;
+                            let content_rect = egui::Rect::from_min_max(
+                                egui::pos2(lx - 10.0, rect.min.y),
+                                egui::pos2(rect.max.x - 4.0, rect.max.y),
+                            );
+                            let size = match h.level {
+                                1 => 13.5,
+                                2 => 13.0,
+                                3 => 12.5,
+                                4 => 12.0,
+                                _ => 11.5,
+                            };
+                            let display = if h.title.trim().is_empty() {
+                                "(untitled)".to_string()
+                            } else {
+                                h.title.clone()
+                            };
+                            let mut rt = RichText::new(display).size(size);
+                            if h.level == 1 {
+                                rt = rt.font(FontId::new(size, theme::family_bold()));
+                            }
+                            rt = rt.color(if active { pal.accent } else { pal.text });
+                            let tip = format!("Line {} \u{2014} click to jump", h.line + 1);
+                            ui.allocate_new_ui(
+                                UiBuilder::new().max_rect(content_rect),
+                                |ui| {
+                                    ui.with_layout(
+                                        Layout::left_to_right(Align::Center),
+                                        |ui| {
+                                            if has_children {
+                                                let (cr, cresp) = ui.allocate_exact_size(
+                                                    egui::vec2(20.0, 22.0),
+                                                    Sense::click(),
+                                                );
+                                                if cresp.hovered() {
+                                                    ui.painter().rect_filled(
+                                                        cr,
+                                                        4.0,
+                                                        pal.hover,
+                                                    );
+                                                    ui.ctx().set_cursor_icon(
+                                                        egui::CursorIcon::PointingHand,
+                                                    );
+                                                }
+                                                paint_caret_tri(
+                                                    ui,
+                                                    cr.center(),
+                                                    open,
+                                                    if cresp.hovered() {
+                                                        pal.text
+                                                    } else {
+                                                        pal.weak
+                                                    },
+                                                );
+                                                if cresp.clicked() {
+                                                    caret_toggle = true;
+                                                }
+                                                let _ = cresp.on_hover_text(if open {
+                                                    "Collapse section"
+                                                } else {
+                                                    "Expand section"
+                                                });
+                                            } else {
+                                                ui.add_space(20.0);
+                                            }
+                                            ui.add(Label::new(rt).truncate());
+                                        },
+                                    );
+                                },
+                            );
+                            let resp = resp.on_hover_text(tip);
+                            if caret_toggle {
+                                if open {
+                                    self.outline_collapsed.insert(h.line);
+                                } else {
+                                    self.outline_collapsed.remove(&h.line);
+                                }
+                            } else if resp.clicked() {
+                                self.jump = Some(h.line);
+                                self.active_outline = Some(h.line);
+                                if self.state.view == ViewMode::Preview {
+                                    self.state.view = ViewMode::Source;
+                                }
+                            }
+
+                            if has_children {
                                 open_ancestors.push((h.level, h.line));
                             }
                         }
@@ -1181,10 +1363,10 @@ fn segmented_view(
     Frame::default()
         .fill(pal.faint_fill)
         .corner_radius(5)
-        .inner_margin(Margin::same(2))
+        .inner_margin(Margin::symmetric(3, 1))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
-                for m in [ViewMode::Source, ViewMode::Split, ViewMode::Preview] {
+                for m in [ViewMode::Source, ViewMode::Preview] {
                     let sel = m == current;
                     let txt = RichText::new(m.label())
                         .size(12.5)
@@ -1267,38 +1449,76 @@ fn kbd_chip(ui: &mut egui::Ui, keys: &str, desc: &str, pal: &theme::Palette) {
         });
 }
 
-fn draw_caret(ui: &mut egui::Ui, expanded: bool) -> egui::Response {
-    let pal = theme::palette(ui.visuals().dark_mode);
-    let (rect, resp) = ui.allocate_exact_size(egui::Vec2::splat(16.0), Sense::click());
-    if resp.hovered() {
-        ui.painter().rect_filled(rect.expand(2.0), 3, pal.hover);
+const TREE_ROW_H: f32 = 26.0;
+const TREE_STEP: f32 = 14.0;
+const OUTLINE_ROW_H: f32 = 24.0;
+const OUTLINE_STEP: f32 = 12.0;
+
+/// Full-width clickable row background with rounded hover / selection fill.
+/// `tinted` selects the accent-tinted fill (outline active row) instead of the
+/// neutral fill + accent bar (files active row).
+fn tree_row_frame(
+    ui: &mut egui::Ui,
+    pal: &theme::Palette,
+    h: f32,
+    selected: bool,
+    tinted: bool,
+) -> (egui::Rect, egui::Response) {
+    let (rect, resp) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), h), Sense::click());
+    let hovered = resp.hovered();
+    if selected || hovered {
+        let fill = if selected {
+            if tinted {
+                pal.accent.gamma_multiply(0.20)
+            } else {
+                pal.active
+            }
+        } else {
+            pal.hover
+        };
+        ui.painter().rect_filled(rect, 5.0, fill);
+        if selected && !tinted {
+            ui.painter().rect_filled(
+                egui::Rect::from_min_size(
+                    rect.min + egui::vec2(1.5, 5.0),
+                    egui::vec2(2.5, h - 10.0),
+                ),
+                1.5,
+                pal.accent,
+            );
+        }
     }
-    let c = rect.center();
-    let s = 3.4f32;
-    let pts: Vec<egui::Pos2> = if expanded {
-        vec![
-            egui::pos2(c.x - s, c.y - s * 0.55),
-            egui::pos2(c.x + s, c.y - s * 0.55),
-            egui::pos2(c.x, c.y + s * 0.9),
-        ]
-    } else {
-        vec![
-            egui::pos2(c.x - s * 0.55, c.y - s),
-            egui::pos2(c.x - s * 0.55, c.y + s),
-            egui::pos2(c.x + s * 0.9, c.y),
-        ]
-    };
-    ui.painter().add(egui::Shape::convex_polygon(pts, pal.weak, egui::Stroke::NONE));
-    resp
+    if hovered {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    (rect, resp)
 }
 
-fn draw_caret_small(ui: &mut egui::Ui, expanded: bool) -> egui::Response {
-    let pal = theme::palette(ui.visuals().dark_mode);
-    let (rect, resp) = ui.allocate_exact_size(egui::Vec2::new(13.0, 16.0), Sense::click());
-    let color = if resp.hovered() { pal.text } else { pal.weak };
-    let c = rect.center();
-    let s = 2.8f32;
-    let pts: Vec<egui::Pos2> = if expanded {
+fn level_x(rect: egui::Rect, depth: usize, step: f32) -> f32 {
+    rect.min.x + 12.0 + depth as f32 * step
+}
+
+/// Faint vertical indent guides, one per ancestor level.
+fn paint_guides(
+    ui: &mut egui::Ui,
+    pal: &theme::Palette,
+    rect: egui::Rect,
+    depth: usize,
+    step: f32,
+) {
+    for d in 0..depth {
+        let x = level_x(rect, d, step);
+        ui.painter().line_segment(
+            [egui::pos2(x, rect.min.y - 1.0), egui::pos2(x, rect.max.y + 1.0)],
+            egui::Stroke::new(1.0_f32, pal.stroke),
+        );
+    }
+}
+
+fn paint_caret_tri(ui: &mut egui::Ui, c: egui::Pos2, open: bool, col: Color32) {
+    let s = 3.4f32;
+    let pts: Vec<egui::Pos2> = if open {
         vec![
             egui::pos2(c.x - s, c.y - s * 0.55),
             egui::pos2(c.x + s, c.y - s * 0.55),
@@ -1311,8 +1531,193 @@ fn draw_caret_small(ui: &mut egui::Ui, expanded: bool) -> egui::Response {
             egui::pos2(c.x + s * 0.9, c.y),
         ]
     };
-    ui.painter().add(egui::Shape::convex_polygon(pts, color, egui::Stroke::NONE));
-    resp
+    ui.painter()
+        .add(egui::Shape::convex_polygon(pts, col, egui::Stroke::NONE));
+}
+
+fn paint_folder_icon(ui: &mut egui::Ui, c: egui::Pos2, col: Color32) {
+    let p = ui.painter();
+    p.rect_filled(
+        egui::Rect::from_min_size(egui::pos2(c.x - 6.0, c.y - 4.5), egui::vec2(5.0, 3.5)),
+        1.0,
+        col,
+    );
+    p.rect_filled(
+        egui::Rect::from_min_size(egui::pos2(c.x - 6.0, c.y - 2.5), egui::vec2(12.0, 7.0)),
+        1.8,
+        col,
+    );
+}
+
+fn paint_doc_icon(ui: &mut egui::Ui, c: egui::Pos2, col: Color32) {
+    let (w, h, f) = (8.5, 11.0, 2.8);
+    let x0 = c.x - w / 2.0;
+    let y0 = c.y - h / 2.0;
+    let pts = vec![
+        egui::pos2(x0, y0),
+        egui::pos2(x0 + w - f, y0),
+        egui::pos2(x0 + w, y0 + f),
+        egui::pos2(x0 + w, y0 + h),
+        egui::pos2(x0, y0 + h),
+    ];
+    ui.painter()
+        .add(egui::Shape::convex_polygon(pts, col, egui::Stroke::NONE));
+}
+
+/// Vault switcher card: accent avatar tile with the folder initial,
+/// bold vault name and muted full path.
+fn vault_card(ui: &mut egui::Ui, pal: &theme::Palette, name: &str, path: &str) -> egui::Response {
+    let (rect, resp) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 42.0), Sense::hover());
+    ui.painter().rect_filled(rect, 6.0, pal.faint_fill);
+    let text_rect = egui::Rect::from_min_max(
+        egui::pos2(rect.min.x + 10.0, rect.min.y + 5.0),
+        egui::pos2(rect.max.x - 8.0, rect.max.y - 5.0),
+    );
+    ui.allocate_new_ui(UiBuilder::new().max_rect(text_rect), |ui| {
+        ui.vertical(|ui| {
+            ui.spacing_mut().item_spacing.y = 0.0;
+            ui.add(
+                Label::new(
+                    RichText::new(name)
+                        .size(13.0)
+                        .font(FontId::new(13.0, theme::family_bold()))
+                        .color(pal.text),
+                )
+                .truncate(),
+            );
+            ui.add(Label::new(RichText::new(path).size(10.5).color(pal.weak)).truncate());
+        });
+    });
+    resp.on_hover_text(path.to_string())
+}
+
+fn tree_empty(ui: &mut egui::Ui, pal: &theme::Palette, msg: &str) {
+    ui.add_space(18.0);
+    ui.vertical_centered(|ui| {
+        ui.label(RichText::new("\u{25cb}").size(22.0).color(pal.weak));
+        ui.add_space(4.0);
+        ui.label(RichText::new(msg).size(12.5).color(pal.weak));
+    });
+}
+
+fn folder_row(
+    ui: &mut egui::Ui,
+    pal: &theme::Palette,
+    depth: usize,
+    expanded: bool,
+    name: &str,
+    tip: &str,
+) -> egui::Response {
+    let (rect, resp) = tree_row_frame(ui, pal, TREE_ROW_H, false, false);
+    paint_guides(ui, pal, rect, depth, TREE_STEP);
+    let cy = rect.center().y;
+    let lx = level_x(rect, depth, TREE_STEP);
+    paint_caret_tri(ui, egui::pos2(lx, cy), expanded, pal.weak);
+    paint_folder_icon(
+        ui,
+        egui::pos2(lx + 16.0, cy),
+        if expanded { pal.text } else { pal.weak },
+    );
+    let text_rect = egui::Rect::from_min_max(
+        egui::pos2(lx + 28.0, rect.min.y),
+        egui::pos2(rect.max.x - 6.0, rect.max.y),
+    );
+    ui.allocate_new_ui(UiBuilder::new().max_rect(text_rect), |ui| {
+        ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+            ui.add(
+                Label::new(
+                    RichText::new(name)
+                        .size(13.0)
+                        .font(FontId::new(13.0, theme::family_bold()))
+                        .color(pal.text),
+                )
+                .truncate(),
+            );
+        });
+    });
+    resp.on_hover_text(tip)
+}
+
+/// Returns true when the row was clicked.
+fn file_row(
+    ui: &mut egui::Ui,
+    pal: &theme::Palette,
+    depth: usize,
+    selected: bool,
+    dirty: bool,
+    name: &str,
+    tip: &str,
+) -> bool {
+    let (rect, resp) = tree_row_frame(ui, pal, TREE_ROW_H, selected, false);
+    paint_guides(ui, pal, rect, depth, TREE_STEP);
+    let cy = rect.center().y;
+    let lx = level_x(rect, depth, TREE_STEP);
+    paint_doc_icon(
+        ui,
+        egui::pos2(lx + 16.0, cy),
+        if selected { pal.accent } else { pal.weak },
+    );
+    if dirty {
+        ui.painter()
+            .circle_filled(egui::pos2(rect.max.x - 12.0, cy), 3.0, pal.accent);
+    }
+    let text_rect = egui::Rect::from_min_max(
+        egui::pos2(lx + 28.0, rect.min.y),
+        egui::pos2(rect.max.x - if dirty { 22.0 } else { 6.0 }, rect.max.y),
+    );
+    ui.allocate_new_ui(UiBuilder::new().max_rect(text_rect), |ui| {
+        ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+            ui.add(Label::new(RichText::new(name).size(13.0).color(pal.text)).truncate());
+        });
+    });
+    resp.on_hover_text(tip).clicked()
+}
+
+fn dir_counts(entries: &[Entry]) -> (usize, usize) {
+    let mut dirs = 0;
+    let mut files = 0;
+    for e in entries {
+        if e.is_dir {
+            dirs += 1;
+        } else {
+            files += 1;
+        }
+    }
+    (dirs, files)
+}
+
+/// Recursive markdown collection for the files search box (depth + total capped).
+fn collect_md(root: &Path, out: &mut Vec<PathBuf>, limit: usize, depth: usize) {
+    if out.len() >= limit || depth > 5 {
+        return;
+    }
+    let Ok(rd) = std::fs::read_dir(root) else {
+        return;
+    };
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    for ent in rd.flatten() {
+        let name = ent.file_name().to_string_lossy().to_string();
+        if name.starts_with('.') || name.starts_with('$') {
+            continue;
+        }
+        let p = ent.path();
+        let is_dir = ent.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        if is_dir {
+            dirs.push(p);
+        } else if crate::fs_tree::is_markdown(&p) {
+            if out.len() < limit {
+                out.push(p);
+            }
+        }
+    }
+    dirs.sort();
+    for d in dirs {
+        if out.len() >= limit {
+            break;
+        }
+        collect_md(&d, out, limit, depth + 1);
+    }
 }
 
 fn editor_pane(
@@ -1320,13 +1725,17 @@ fn editor_pane(
     doc: &mut Document,
     jump: &mut Option<usize>,
     pitch: &mut f32,
-) {
-    ScrollArea::both()
+    scroll_override: Option<f32>,
+) -> ViewScroll {
+    let mut area = ScrollArea::both()
         .id_salt("editor-scroll")
         .auto_shrink(false)
         .drag_to_scroll(false)
-        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
-        .show(ui, |ui| {
+        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible);
+    if let Some(y) = scroll_override {
+        area = area.vertical_scroll_offset(y);
+    }
+    let out = area.show(ui, |ui| {
             let margin: f32 = 8.0;
             ui.add_space(2.0);
             let prev_pitch = *pitch;
@@ -1362,18 +1771,45 @@ fn editor_pane(
                 });
                 inner.inner.1.scroll_to_me(Some(Align::Center));
             }
+            // Trailing canvas: lets the last line scroll up from the viewport
+            // bottom (Obsidian-style scroll-past-end). View-only padding,
+            // never written to the file.
+            let pad = (ui.clip_rect().height() - 40.0).max(120.0);
+            ui.add_space(pad);
         });
+    ViewScroll {
+        offset: out.state.offset.y,
+        content: out.content_size.y,
+        viewport: out.inner_rect.height(),
+    }
 }
 
-fn preview_pane(ui: &mut egui::Ui, doc: &mut Document, pv: &mut preview::Preview, dark: bool) {
-    ScrollArea::vertical()
+fn preview_pane(
+    ui: &mut egui::Ui,
+    doc: &mut Document,
+    pv: &mut preview::Preview,
+    dark: bool,
+    scroll_override: Option<f32>,
+) -> ViewScroll {
+    let mut area = ScrollArea::vertical()
         .id_salt("preview-scroll")
         .auto_shrink(false)
         .drag_to_scroll(false)
-        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
-        .show(ui, |ui| {
+        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible);
+    if let Some(y) = scroll_override {
+        area = area.vertical_scroll_offset(y);
+    }
+    let out = area.show(ui, |ui| {
             let base = doc.path.as_ref().and_then(|p| parent_of(p));
             let version = doc.version;
             preview::show(ui, pv, &doc.text, base.as_deref(), dark, version);
+            // Same trailing canvas as the editor: view-only, never saved.
+            let pad = (ui.clip_rect().height() - 40.0).max(120.0);
+            ui.add_space(pad);
         });
+    ViewScroll {
+        offset: out.state.offset.y,
+        content: out.content_size.y,
+        viewport: out.inner_rect.height(),
+    }
 }

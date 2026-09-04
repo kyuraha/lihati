@@ -149,7 +149,6 @@ pub fn apply(ctx: &egui::Context) {
 
 pub fn set_pref(ctx: &egui::Context, pref: ThemePref) {
     ctx.set_theme(match pref {
-        ThemePref::System => egui::ThemePreference::System,
         ThemePref::Dark => egui::ThemePreference::Dark,
         ThemePref::Light => egui::ThemePreference::Light,
     });

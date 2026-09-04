@@ -2,13 +2,26 @@ use serde::{Deserialize, Serialize};
 
 pub const STATE_KEY: &str = "lihati_state_v1";
 
-#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Serialize, Clone, Copy, PartialEq, Eq, Debug)]
 #[derive(Default)]
 pub enum ViewMode {
     #[default]
     Source,
-    Split,
     Preview,
+}
+
+impl<'de> Deserialize<'de> for ViewMode {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        // Legacy "Split" mode maps to Source.
+        Ok(match s.to_ascii_lowercase().as_str() {
+            "preview" => ViewMode::Preview,
+            _ => ViewMode::Source,
+        })
+    }
 }
 
 
@@ -16,19 +29,31 @@ impl ViewMode {
     pub fn label(&self) -> &'static str {
         match self {
             ViewMode::Source => "Source",
-            ViewMode::Split => "Split",
             ViewMode::Preview => "Preview",
         }
     }
 }
 
-#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Serialize, Clone, Copy, PartialEq, Eq, Debug)]
 #[derive(Default)]
 pub enum ThemePref {
     #[default]
-    System,
-    Dark,
     Light,
+    Dark,
+}
+
+impl<'de> Deserialize<'de> for ThemePref {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        // Legacy "System" preference maps to Light, the new default.
+        Ok(match s.to_ascii_lowercase().as_str() {
+            "dark" => ThemePref::Dark,
+            _ => ThemePref::Light,
+        })
+    }
 }
 
 
@@ -50,7 +75,7 @@ impl Default for PersistState {
             show_dir: true,
             show_outline: true,
             view: ViewMode::Source,
-            theme: ThemePref::System,
+            theme: ThemePref::Light,
             zoom: 1.0,
             root: None,
             last_file: None,
@@ -80,7 +105,7 @@ mod tests {
     fn state_roundtrip() {
         let mut s = PersistState::default();
         s.show_dir = false;
-        s.view = ViewMode::Split;
+        s.view = ViewMode::Preview;
         s.theme = ThemePref::Dark;
         s.zoom = 1.4;
         s.root = Some("C:\\notes".into());
@@ -88,7 +113,7 @@ mod tests {
 
         let json = serde_json::to_string(&s).unwrap();
         let back: PersistState = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.view, ViewMode::Split);
+        assert_eq!(back.view, ViewMode::Preview);
         assert_eq!(back.theme, ThemePref::Dark);
         assert_eq!(back.zoom, 1.4);
         assert_eq!(back.recents.len(), 2);

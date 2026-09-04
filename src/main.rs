@@ -11,6 +11,11 @@ mod theme;
 
 use std::path::PathBuf;
 
+/// Window + taskbar icon (blue "L"). This overrides eframe's default
+/// black "e" icon; the same artwork lives in `assets/app.ico` (multi-size)
+/// for Explorer/shortcuts.
+const APP_ICON_PNG: &[u8] = include_bytes!("../assets/app-icon.png");
+
 const HELP: &str = "\
 Lihati \u{2014} a minimal Markdown editor for Windows
 
@@ -55,7 +60,10 @@ fn main() -> Result<(), String> {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_inner_size([1300.0, 850.0])
             .with_min_inner_size([720.0, 480.0])
-            .with_title("Lihati"),
+            .with_title("Lihati")
+            .with_icon(
+                eframe::icon_data::from_png_bytes(APP_ICON_PNG).expect("invalid app icon"),
+            ),
         persist_window: true,
         ..Default::default()
     };
