@@ -123,6 +123,14 @@ fn styled(dark: bool) -> Style {
     style.spacing.button_padding = egui::vec2(8.0, 4.0);
     style.spacing.menu_margin = Margin::same(6);
     style.scroll_animation = egui::style::ScrollAnimation::none();
+    // Grab zone for the panel splitters (Fitts's law). Keep it snug: the zone
+    // starts exactly where the center scrollbar starts, so there is no stray
+    // sliver on its left that would read as a second hotspot.
+    style.interaction.resize_grab_radius_side = 12.0;
+    // Freeze floating scrollbars at full width: the default thin<->wide pulse
+    // on hover makes the hit-area next to a panel splitter breathe, which
+    // reads as phantom hotspots and cursor flicker.
+    style.spacing.scroll.floating_width = style.spacing.scroll.bar_width;
     style.text_styles = [
         (egui::TextStyle::Body, egui::FontId::proportional(15.0)),
         (egui::TextStyle::Button, egui::FontId::proportional(13.5)),

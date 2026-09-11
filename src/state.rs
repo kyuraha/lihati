@@ -67,6 +67,8 @@ pub struct PersistState {
     pub root: Option<String>,
     pub last_file: Option<String>,
     pub recents: Vec<String>,
+    #[serde(default)]
+    pub outline_width: Option<f32>,
 }
 
 impl Default for PersistState {
@@ -80,6 +82,7 @@ impl Default for PersistState {
             root: None,
             last_file: None,
             recents: Vec::new(),
+            outline_width: None,
         }
     }
 }
@@ -110,10 +113,12 @@ mod tests {
         s.zoom = 1.4;
         s.root = Some("C:\\notes".into());
         s.recents = vec!["a.md".into(), "b.md".into()];
+        s.outline_width = Some(300.0);
 
         let json = serde_json::to_string(&s).unwrap();
         let back: PersistState = serde_json::from_str(&json).unwrap();
         assert_eq!(back.view, ViewMode::Preview);
+        assert_eq!(back.outline_width, Some(300.0));
         assert_eq!(back.theme, ThemePref::Dark);
         assert_eq!(back.zoom, 1.4);
         assert_eq!(back.recents.len(), 2);

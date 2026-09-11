@@ -63,6 +63,9 @@ pub struct App {
     prev_scroll: ViewScroll,
     last_view: ViewMode,
     scroll_override: Option<f32>,
+    files_rect: Option<egui::Rect>,
+    outline_rect: Option<egui::Rect>,
+    outline_width: f32,
     dir_cache: HashMap<PathBuf, (Instant, Arc<Vec<Entry>>)>,
     preview: preview::Preview,
     toasts: Vec<Toast>,
@@ -94,6 +97,7 @@ impl App {
 
         let now = Instant::now();
         let last_view = state.view;
+        let outline_width = state.outline_width.unwrap_or(250.0).clamp(170.0, 420.0);
         let mut app = App {
             state,
             doc: Document::new(),
@@ -107,6 +111,9 @@ impl App {
             prev_scroll: ViewScroll::default(),
             last_view,
             scroll_override: None,
+            files_rect: None,
+            outline_rect: None,
+            outline_width,
             dir_cache: HashMap::new(),
             preview: preview::Preview::new(),
             toasts: Vec::new(),
@@ -523,6 +530,7 @@ impl App {
             .resizable(true)
             .default_width(240.0)
             .width_range(170.0..=420.0)
+            .show_separator_line(false)
             .frame(
                 Frame::default()
                     .fill(pal.panel)
@@ -530,6 +538,7 @@ impl App {
                     .inner_margin(Margin::symmetric(8, 6)),
             )
             .show(ctx, |ui| {
+                self.files_rect = Some(ui.max_rect());
                 // ---- vault card ----
                 if let Some(root) = self.root.clone() {
                     let name = root
@@ -762,9 +771,9 @@ impl App {
     fn draw_outline_panel(&mut self, ctx: &egui::Context) {
         let pal = self.pal();
         egui::SidePanel::right("outline-panel")
-            .resizable(true)
-            .default_width(250.0)
-            .width_range(170.0..=420.0)
+            .resizable(false)
+            .exact_width(self.outline_width.clamp(170.0, 420.0))
+            .show_separator_line(false)
             .frame(
                 Frame::default()
                     .fill(pal.panel)
@@ -772,6 +781,14 @@ impl App {
                     .inner_margin(Margin::symmetric(8, 6)),
             )
             .show(ctx, |ui| {
+                self.outline_rect = Some(ui.max_rect());
+                // Splitter metrics first: available height shrinks as content
+                // is laid out, so measure before adding widgets. The handle
+                // itself is allocated at the very end (allocating it up-front
+                // consumed the panel's layout space and pushed content out).
+                let htop = ui.max_rect().min.y;
+                let hfull = ui.available_height();
+                let hedge = ui.max_rect().min.x - 8.0;
                 // ---- search ----
                 ui.horizontal(|ui| {
                     let clear_w = if self.outline_filter.is_empty() { 0.0 } else { 26.0 };
@@ -903,9 +920,6 @@ impl App {
                                                         4.0,
                                                         pal.hover,
                                                     );
-                                                    ui.ctx().set_cursor_icon(
-                                                        egui::CursorIcon::PointingHand,
-                                                    );
                                                 }
                                                 paint_caret_tri(
                                                     ui,
@@ -953,7 +967,66 @@ impl App {
                             }
                         }
                     });
+                // Explicit splitter handle LAST: same metrics as captured
+                // above; allocating here only takes dead space below content.
+                // Drag-only strip just inside the edge (rows keep clicks).
+                let hr = egui::Rect::from_min_max(
+                    egui::pos2(hedge + 2.0, htop),
+                    egui::pos2(hedge + 14.0, htop + hfull),
+                );
+                let mut w = self.outline_width;
+                ui.allocate_new_ui(UiBuilder::new().max_rect(hr), |ui| {
+                    let (_, resp) = ui.allocate_exact_size(hr.size(), Sense::drag());
+                    if resp.hovered() || resp.dragged() {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+                    }
+                    if resp.dragged() {
+                        w = (w - resp.drag_delta().x).clamp(170.0, 420.0);
+                    }
+                });
+                self.outline_width = w;
             });
+    }
+
+    /// Visible splitter grips: three dots exactly on each panel edge so the
+    /// eye can acquire the (invisible, generous) drag zone without hunting.
+    fn paint_splitter_grips(&self, ctx: &egui::Context) {
+        if self.pending.is_some() {
+            return;
+        }
+        let pal = self.pal();
+        let pointer = ctx.pointer_hover_pos();
+        let panels = [
+            (self.state.show_dir, self.files_rect, true),
+            (self.state.show_outline, self.outline_rect, false),
+        ];
+        for (shown, rect_opt, is_left) in panels {
+            if !shown {
+                continue;
+            }
+            let Some(r) = rect_opt else { continue };
+            // Dots sit just inside the panel, in the middle of the EFFECTIVE
+            // grab band: the center scrollbar covers the zone part left of the
+            // edge, so grabbing exactly on the line would catch the scrollbar.
+            let edge = if is_left { r.max.x + 8.0 } else { r.min.x - 8.0 };
+            let x = if is_left { r.max.x } else { r.min.x };
+            let y = (r.min.y + r.max.y) * 0.5;
+            let hot = pointer
+                .map(|p| (p.x - edge).abs() <= 14.0 && r.y_range().contains(p.y))
+                .unwrap_or(false);
+            let col = if hot {
+                pal.accent
+            } else {
+                pal.weak.gamma_multiply(0.55)
+            };
+            let painter = ctx.layer_painter(egui::LayerId::new(
+                egui::Order::Foreground,
+                egui::Id::new("splitter-grips"),
+            ));
+            for dy in [-7.0, 0.0, 7.0] {
+                painter.circle_filled(egui::pos2(x, y + dy), 1.6, col);
+            }
+        }
     }
 
     fn draw_status(&mut self, ctx: &egui::Context) {
@@ -972,8 +1045,11 @@ impl App {
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         ui.label(
                             RichText::new(format!(
-                                "{} words \u{00b7} {} lines \u{00b7} {:.0}%",
-                                self.words, self.lines, self.state.zoom * 100.0
+                                "{} \u{00b7} {} words \u{00b7} {} lines \u{00b7} {:.0}%",
+                                option_env!("LIHATI_BUILD_TAG").unwrap_or("dev"),
+                                self.words,
+                                self.lines,
+                                self.state.zoom * 100.0
                             ))
                             .size(11.5)
                             .color(pal.weak),
@@ -1285,6 +1361,7 @@ impl eframe::App for App {
         self.draw_modal(ctx);
         self.draw_find(ctx);
         self.draw_toasts(ctx);
+        self.paint_splitter_grips(ctx);
 
         if self.last_store.elapsed() > STORE_INTERVAL {
             sync_state(self);
@@ -1333,6 +1410,7 @@ fn sync_state(app: &mut App) {
         .as_ref()
         .map(|p| p.to_string_lossy().to_string());
     app.state.root = app.root.as_ref().map(|p| p.to_string_lossy().to_string());
+    app.state.outline_width = Some(app.outline_width);
 }
 
 fn parent_of(path: &Path) -> Option<PathBuf> {
@@ -1489,9 +1567,9 @@ fn tree_row_frame(
             );
         }
     }
-    if hovered {
-        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-    }
+    // Tree rows deliberately do NOT set a hand cursor: like Explorer, VS Code
+    // and Obsidian they signal clickability with hover highlight only, so the
+    // panel splitter stays the single cursor-changing spot near the edge.
     (rect, resp)
 }
 
@@ -1727,7 +1805,11 @@ fn editor_pane(
     pitch: &mut f32,
     scroll_override: Option<f32>,
 ) -> ViewScroll {
-    let mut area = ScrollArea::both()
+    // NOTE: vertical() is load-bearing. Inside ScrollArea::both the horizontal
+    // axis is unbounded, and multiline TextEdit (clip_text:false) sizes itself
+    // to galley.max(wrap_width) — i.e. ~infinitely wide — sliding UNDER the
+    // side panels. With vertical-only scroll the width stays viewport-bound.
+    let mut area = ScrollArea::vertical()
         .id_salt("editor-scroll")
         .auto_shrink(false)
         .drag_to_scroll(false)
@@ -1811,5 +1893,394 @@ fn preview_pane(
         offset: out.state.offset.y,
         content: out.content_size.y,
         viewport: out.inner_rect.height(),
+    }
+}
+
+/// Diagnostic harness (kept as a regression test): sweep a virtual pointer
+/// horizontally across the outline splitter and record which cursor icon
+/// egui reports. Replicates the real layout 1:1 (frames, margins, spacing,
+/// rows with tooltips + hand cursor, editor with always-visible scrollbars).
+#[cfg(test)]
+mod splitter_cursor_probe {
+    use eframe::egui::{
+        self, Align, CentralPanel, CursorIcon, Event, Frame, Layout, Margin, Pos2, RawInput,
+        Rect, RichText, ScrollArea, Sense, TextEdit, UiBuilder,
+    };
+    use super::{OUTLINE_ROW_H, OUTLINE_STEP, paint_guides, tree_row_frame};
+
+    fn screen() -> Rect {
+        Rect::from_min_size(Pos2::ZERO, egui::vec2(1536.0, 937.0))
+    }
+
+    fn probe_row(ui: &mut egui::Ui, h: f32, _tip: String) {
+        // Mirrors tree_row_frame: hover highlight only, plain arrow cursor.
+        let _ = ui.allocate_exact_size(egui::vec2(ui.available_width(), h), Sense::click());
+    }
+
+    fn build_ui(ctx: &egui::Context) {
+        egui::TopBottomPanel::top("toolbar")
+            .frame(Frame::default().inner_margin(Margin::symmetric(10, 5)))
+            .show(ctx, |ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
+                ui.add_sized([ui.available_width(), 26.0], egui::Label::new("toolbar"));
+            });
+        egui::SidePanel::left("files-panel")
+            .resizable(true)
+            .default_width(259.0)
+            .width_range(170.0..=420.0)
+            .show_separator_line(false)
+            .frame(Frame::default().inner_margin(Margin::symmetric(8, 6)))
+            .show(ctx, |ui| {
+                ui.spacing_mut().item_spacing.y = 1.0;
+                for i in 0..30 {
+                    probe_row(ui, 26.0, format!("C:\\notes\\file{i:02}.md"));
+                }
+            });
+        let mut edge = 1141.0;
+        egui::SidePanel::right("outline-panel")
+            .resizable(false)
+            .exact_width(395.0)
+            .show_separator_line(false)
+            .frame(Frame::default().inner_margin(Margin::symmetric(8, 6)))
+            .show(ctx, |ui| {
+                edge = ui.max_rect().min.x - 8.0;
+                // Explicit handle mirror: drag-only strip just inside the edge.
+                let htop = ui.max_rect().min.y;
+                let hfull = ui.available_height();
+                let hr = egui::Rect::from_min_max(
+                    egui::pos2(edge + 2.0, htop),
+                    egui::pos2(edge + 14.0, htop + hfull),
+                );
+                ui.allocate_new_ui(UiBuilder::new().max_rect(hr), |ui| {
+                    let (_, resp) = ui.allocate_exact_size(hr.size(), Sense::drag());
+                    if resp.hovered() || resp.dragged() {
+                        ui.ctx().set_cursor_icon(CursorIcon::ResizeHorizontal);
+                    }
+                });
+                ui.spacing_mut().item_spacing.y = 1.0;
+                for i in 0..40 {
+                    probe_row(ui, 24.0, format!("Line {} \u{2014} click to jump", i * 7 + 1));
+                }
+            });
+        // Central panel LAST: side panels must reserve space first,
+        // otherwise it spans full width underneath them.
+        CentralPanel::default()
+            .frame(Frame::default())
+            .show(ctx, |ui| {
+                ScrollArea::vertical()
+                    .id_salt("editor-scroll")
+                    .auto_shrink(false)
+                    .drag_to_scroll(false)
+                    .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
+                    .show(ui, |ui| {
+                        let mut text = "lorem ipsum dolor sit amet consectetur\n".repeat(300);
+                        let _ = TextEdit::multiline(&mut text)
+                            .id_salt("main-editor")
+                            .desired_width(ui.available_width() - 16.0)
+                            .frame(false)
+                            .show(ui);
+                        ui.add_space(800.0);
+                    });
+            });
+    }
+
+    fn run_frame(ctx: &egui::Context, x: f32, y: f32, t: f64) -> CursorIcon {
+        let mut raw = RawInput::default();
+        raw.screen_rect = Some(screen());
+        raw.time = Some(t);
+        raw.events.push(Event::PointerMoved(Pos2::new(x, y)));
+        let out = ctx.run(raw, build_ui);
+        out.platform_output.cursor_icon
+    }
+
+    fn sweep(ctx: &egui::Context, y: f32, t: &mut f64, x0: i32, x1: i32) -> Vec<(i32, CursorIcon)> {
+        let mut map = Vec::new();
+        let mut x = x0;
+        while x <= x1 {
+            let mut cur = CursorIcon::Default;
+            for _ in 0..5 {
+                *t += 1.0 / 60.0;
+                cur = run_frame(ctx, x as f32, y, *t);
+            }
+            map.push((x, cur));
+            x += 2;
+        }
+        map
+    }
+
+    /// Diagnostic: does exact_width constrain the panel?
+    #[test]
+    fn splitter_exact_width_debug() {
+        let ctx = egui::Context::default();
+        crate::theme::init_fonts(&ctx);
+        crate::theme::apply(&ctx);
+        let mut raw = RawInput::default();
+        raw.screen_rect = Some(screen());
+        raw.time = Some(1.0);
+        raw.events.push(Event::PointerMoved(Pos2::new(10.0, 10.0)));
+        let _ = ctx.run(raw, |ctx| {
+            egui::SidePanel::right("outline-panel")
+                .resizable(false)
+                .exact_width(344.0)
+                .show_separator_line(false)
+                .frame(Frame::default().inner_margin(Margin::symmetric(8, 6)))
+                .show(ctx, |ui| {
+                    println!("outline content max_rect={:?}", ui.max_rect());
+                    println!("outline avail w={:.0}", ui.available_width());
+                });
+        });
+    }
+
+    /// Diagnostic: tessellate one frame and histogram dark vertices by x.
+    /// Finds any tall dark painted column (mystery thick line audit).
+    #[test]
+    fn paint_audit_dark_columns() {
+        use std::collections::BTreeMap;
+        let ctx = egui::Context::default();
+        crate::theme::init_fonts(&ctx);
+        crate::theme::apply(&ctx);
+        ctx.set_theme(egui::ThemePreference::Light);
+        let pal = crate::theme::palette(false);
+        let mut raw = RawInput::default();
+        raw.screen_rect = Some(screen());
+        raw.time = Some(1.0);
+        raw.events.push(Event::PointerMoved(Pos2::new(100.0, 500.0)));
+        let mut edge = 0.0f32;
+        let out = ctx.run(raw, |ctx| {
+            egui::TopBottomPanel::top("toolbar")
+                .frame(Frame::default().inner_margin(Margin::symmetric(10, 5)))
+                .show(ctx, |ui| {
+                    ui.add_sized([ui.available_width(), 26.0], egui::Label::new("toolbar"));
+                });
+            egui::SidePanel::right("outline-panel")
+                .resizable(false)
+                .exact_width(344.0)
+                .show_separator_line(false)
+                .frame(
+                    Frame::default()
+                        .fill(pal.panel)
+                        .stroke(egui::Stroke::new(1.0_f32, pal.stroke))
+                        .inner_margin(Margin::symmetric(8, 6)),
+                )
+                .show(ctx, |ui| {
+                    edge = ui.max_rect().min.x - 8.0;
+                    ui.add_sized(
+                        [ui.available_width(), 24.0],
+                        egui::TextEdit::singleline(&mut String::from("Search outline...")),
+                    );
+                    for i in 0..40 {
+                        probe_row(ui, 24.0, format!("heading {i} with a fairly long title here"));
+                    }
+                    // App handle mirror (invisible drag strip).
+                    let htop = ui.max_rect().min.y;
+                    let hfull = ui.available_height();
+                    let hr = egui::Rect::from_min_max(
+                        egui::pos2(edge + 2.0, htop),
+                        egui::pos2(edge + 14.0, htop + hfull),
+                    );
+                    ui.allocate_new_ui(UiBuilder::new().max_rect(hr), |ui| {
+                        let _ = ui.allocate_exact_size(hr.size(), Sense::drag());
+                    });
+                });
+            CentralPanel::default()
+                .frame(Frame::default().fill(pal.bg))
+                .show(ctx, |ui| {
+                    ScrollArea::vertical()
+                        .id_salt("preview-scroll")
+                        .auto_shrink(false)
+                        .drag_to_scroll(false)
+                        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
+                        .show(ui, |ui| {
+                            for i in 0..60 {
+                                ui.add(egui::Label::new(format!(
+                                    "Paragraph {i} with enough wrapping text to fill lines."
+                                )));
+                            }
+                            ui.add_space(800.0);
+                        });
+                });
+            // Grip dots mirror.
+            let p = ctx.layer_painter(egui::LayerId::new(
+                egui::Order::Foreground,
+                egui::Id::new("splitter-grips"),
+            ));
+            for dy in [-7.0, 0.0, 7.0] {
+                p.circle_filled(egui::pos2(edge, 500.0 + dy), 1.6, pal.accent);
+            }
+        });
+        println!("edge={edge:.0}");
+        let prims = ctx.tessellate(out.shapes, 1.0);
+        let mut cols: BTreeMap<i32, (usize, u32, u32, u32)> = BTreeMap::new();
+        for prim in &prims {
+            let egui::epaint::Primitive::Mesh(mesh) = &prim.primitive else {
+                continue;
+            };
+            for v in &mesh.vertices {
+                let c = v.color;
+                if c.r() < 90 && c.g() < 90 && c.b() < 90 && c.a() > 100 {
+                    let e = cols.entry(v.pos.x as i32).or_insert((0, 0, 0, 0));
+                    e.0 += 1;
+                    e.1 += c.r() as u32;
+                    e.2 += c.g() as u32;
+                    e.3 += c.b() as u32;
+                }
+            }
+        }
+        for (x, (n, r, g, b)) in &cols {
+            if *n > 120 {
+                println!("x={x} n={n} avg=({},{},{})", r / *n as u32, g / *n as u32, b / *n as u32);
+            }
+        }
+    }
+
+    /// Diagnostic TEMPORARY: render the user's real doc through the real
+    /// preview + real outline rows, tessellate, hunt tall dark columns.
+    /// DELETE after diagnosis (absolute path, not portable).
+    #[test]
+    fn paint_audit_real_doc() {
+        use std::collections::BTreeMap;
+        let ctx = egui::Context::default();
+        crate::theme::init_fonts(&ctx);
+        crate::theme::apply(&ctx);
+        ctx.set_theme(egui::ThemePreference::Light);
+        let pal = crate::theme::palette(false);
+        let text = std::fs::read_to_string(
+            "C:\\Users\\okky\\ZTextproject\\level 1\\roblox-gamejam-readiness.md",
+        )
+        .expect("user doc must exist");
+        let headings = crate::markdown::outline(&text);
+        println!("headings={} text_bytes={}", headings.len(), text.len());
+        let mut raw = RawInput::default();
+        raw.screen_rect = Some(Rect::from_min_size(
+            Pos2::ZERO,
+            egui::vec2(1920.0, 1050.0),
+        ));
+        raw.time = Some(1.0);
+        raw.events.push(Event::PointerMoved(Pos2::new(100.0, 500.0)));
+        let mut pv = crate::preview::Preview::new();
+        let out = ctx.run(raw, |ctx| {
+            egui::TopBottomPanel::top("toolbar")
+                .frame(Frame::default().inner_margin(Margin::symmetric(10, 5)))
+                .show(ctx, |ui| {
+                    ui.add_sized([ui.available_width(), 26.0], egui::Label::new("toolbar"));
+                });
+            egui::SidePanel::right("outline-panel")
+                .resizable(false)
+                .exact_width(420.0)
+                .show_separator_line(false)
+                .frame(
+                    Frame::default()
+                        .fill(pal.panel)
+                        .stroke(egui::Stroke::new(1.0_f32, pal.stroke))
+                        .inner_margin(Margin::symmetric(8, 6)),
+                )
+                .show(ctx, |ui| {
+                    ScrollArea::vertical()
+                        .id_salt("outline-scroll")
+                        .auto_shrink(false)
+                        .show(ui, |ui| {
+                            ui.spacing_mut().item_spacing.y = 1.0;
+                            for h in headings.iter() {
+                                let size = match h.level {
+                                    1 => 13.5,
+                                    2 => 13.0,
+                                    _ => 12.0,
+                                };
+                                let (rect, _) =
+                                    tree_row_frame(ui, &pal, OUTLINE_ROW_H, false, true);
+                                paint_guides(ui, &pal, rect, h.level as usize - 1, OUTLINE_STEP);
+                                let tr = egui::Rect::from_min_max(
+                                    egui::pos2(rect.min.x + 20.0, rect.min.y),
+                                    egui::pos2(rect.max.x - 4.0, rect.max.y),
+                                );
+                                ui.allocate_new_ui(UiBuilder::new().max_rect(tr), |ui| {
+                                    ui.with_layout(
+                                        Layout::left_to_right(Align::Center),
+                                        |ui| {
+                                            ui.add(
+                                                egui::Label::new(
+                                                    RichText::new(h.title.clone()).size(size),
+                                                )
+                                                .truncate(),
+                                            );
+                                        },
+                                    );
+                                });
+                            }
+                        });
+                });
+            CentralPanel::default()
+                .frame(Frame::default().fill(pal.bg))
+                .show(ctx, |ui| {
+                    ScrollArea::vertical()
+                        .id_salt("preview-scroll")
+                        .auto_shrink(false)
+                        .drag_to_scroll(false)
+                        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
+                        .show(ui, |ui| {
+                            crate::preview::show(ui, &mut pv, &text, None, false, 1);
+                        });
+                });
+        });
+        let prims = ctx.tessellate(out.shapes, 1.0);
+        let mut cols: BTreeMap<i32, (usize, f32, f32)> = BTreeMap::new();
+        for prim in &prims {
+            let egui::epaint::Primitive::Mesh(mesh) = &prim.primitive else {
+                continue;
+            };
+            for v in &mesh.vertices {
+                let c = v.color;
+                if c.r() < 90 && c.g() < 90 && c.b() < 90 && c.a() > 100 {
+                    let e = cols.entry(v.pos.x as i32).or_insert((0, 1e9, -1e9));
+                    e.0 += 1;
+                    e.1 = e.1.min(v.pos.y);
+                    e.2 = e.2.max(v.pos.y);
+                }
+            }
+        }
+        for (x, (n, y0, y1)) in &cols {
+            // Bar-like: tall span but suspiciously few vertices (a painted
+            // rect is just 2 triangles); glyph columns have high counts.
+            if *y1 - *y0 > 400.0 {
+                println!("x={x} n={n} y=[{y0:.0},{y1:.0}]");
+            }
+        }
+    }
+
+    /// The splitter must be the ONLY cursor-changing spot near a panel edge:
+    /// content cursor, then one ResizeHorizontal band, then plain arrow.
+    #[test]
+    fn splitters_are_single_bands() {
+        let ctx = egui::Context::default();
+        crate::theme::init_fonts(&ctx);
+        crate::theme::apply(&ctx);
+        let mut t = 0.0;
+        for _ in 0..10 {
+            t += 1.0 / 60.0;
+            run_frame(&ctx, 700.0, 500.0, t);
+        }
+        // Outline edge (~x1141): editor text, calm scrollbar strip, one
+        // explicit handle right of the edge, plain rows. No second spot.
+        for (x, c) in sweep(&ctx, 500.0, &mut t, 1050, 1250) {
+            if (1060..=1105).contains(&x) {
+                assert_eq!(c, CursorIcon::Text, "editor should keep text cursor at x={x}");
+            } else if (1125..=1138).contains(&x) {
+                assert_eq!(c, CursorIcon::Default, "no hotspot left of handle at x={x}");
+            } else if (1142..=1158).contains(&x) {
+                assert_eq!(c, CursorIcon::ResizeHorizontal, "single handle at x={x}");
+            } else if (1165..=1240).contains(&x) {
+                assert_eq!(c, CursorIcon::Default, "rows keep arrow cursor at x={x}");
+            }
+        }
+        // Files edge (~x259): plain rows, resize band, editor text.
+        for (x, c) in sweep(&ctx, 500.0, &mut t, 200, 320) {
+            if (205..=240).contains(&x) {
+                assert_eq!(c, CursorIcon::Default, "rows keep arrow cursor at x={x}");
+            } else if (252..=256).contains(&x) {
+                assert_eq!(c, CursorIcon::ResizeHorizontal, "splitter band at x={x}");
+            } else if (290..=315).contains(&x) {
+                assert_eq!(c, CursorIcon::Text, "editor should keep text cursor at x={x}");
+            }
+        }
     }
 }
