@@ -968,22 +968,22 @@ impl App {
                         }
                     });
                 // Explicit splitter handle LAST: same metrics as captured
-                // above; allocating here only takes dead space below content.
+                // above. Hit-test only (no allocation): allocating the strip
+                // would stretch the panel content rect past its frame, push
+                // the central panel away and open a clear-color seam.
                 // Drag-only strip just inside the edge (rows keep clicks).
                 let hr = egui::Rect::from_min_max(
                     egui::pos2(hedge + 2.0, htop),
                     egui::pos2(hedge + 14.0, htop + hfull),
                 );
                 let mut w = self.outline_width;
-                ui.allocate_new_ui(UiBuilder::new().max_rect(hr), |ui| {
-                    let (_, resp) = ui.allocate_exact_size(hr.size(), Sense::drag());
-                    if resp.hovered() || resp.dragged() {
-                        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
-                    }
-                    if resp.dragged() {
-                        w = (w - resp.drag_delta().x).clamp(170.0, 420.0);
-                    }
-                });
+                let resp = ui.interact(hr, egui::Id::new("outline-splitter"), Sense::drag());
+                if resp.hovered() || resp.dragged() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+                }
+                if resp.dragged() {
+                    w = (w - resp.drag_delta().x).clamp(170.0, 420.0);
+                }
                 self.outline_width = w;
             });
     }
@@ -1045,11 +1045,8 @@ impl App {
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         ui.label(
                             RichText::new(format!(
-                                "{} \u{00b7} {} words \u{00b7} {} lines \u{00b7} {:.0}%",
-                                option_env!("LIHATI_BUILD_TAG").unwrap_or("dev"),
-                                self.words,
-                                self.lines,
-                                self.state.zoom * 100.0
+                                "{} words \u{00b7} {} lines \u{00b7} {:.0}%",
+                                self.words, self.lines, self.state.zoom * 100.0
                             ))
                             .size(11.5)
                             .color(pal.weak),
@@ -1809,6 +1806,13 @@ fn editor_pane(
     // axis is unbounded, and multiline TextEdit (clip_text:false) sizes itself
     // to galley.max(wrap_width) — i.e. ~infinitely wide — sliding UNDER the
     // side panels. With vertical-only scroll the width stays viewport-bound.
+    // Hide the scrollbar TRACK on this inner edge: with the global frozen
+    // 10px floating width the full-height rail reads as a thick dark bar
+    // against the outline panel. Thumb stays (position + drag); geometry,
+    // hit-testing and cursors are untouched.
+    ui.style_mut().spacing.scroll.dormant_background_opacity = 0.0;
+    ui.style_mut().spacing.scroll.active_background_opacity = 0.0;
+    ui.style_mut().spacing.scroll.interact_background_opacity = 0.0;
     let mut area = ScrollArea::vertical()
         .id_salt("editor-scroll")
         .auto_shrink(false)
@@ -1873,6 +1877,11 @@ fn preview_pane(
     dark: bool,
     scroll_override: Option<f32>,
 ) -> ViewScroll {
+    // Same trackless treatment as the editor pane: hide the full-height
+    // rail on the outline boundary, keep the position thumb + dragging.
+    ui.style_mut().spacing.scroll.dormant_background_opacity = 0.0;
+    ui.style_mut().spacing.scroll.active_background_opacity = 0.0;
+    ui.style_mut().spacing.scroll.interact_background_opacity = 0.0;
     let mut area = ScrollArea::vertical()
         .id_salt("preview-scroll")
         .auto_shrink(false)
