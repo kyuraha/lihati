@@ -739,17 +739,68 @@ impl App {
                 }
 
                 // Keep the reading position across Source/Preview switches:
-                // map the old view's scroll fraction onto the new view.
+                // sync by *content line* at the top, not just scroll fraction.
+                // That makes outline jumps and manual scrolls stay on the same
+                // heading/paragraph after toggling, both directions.
                 if self.state.view != self.last_view {
-                    let (from, to) = if self.last_view == ViewMode::Source {
-                        (self.src_scroll, self.prev_scroll)
+                    // If there's already a pending outline jump, let that win
+                    // (it was set by clicking a heading and will be consumed
+                    // by the newly shown pane).
+                    if self.jump.is_none() {
+                        let total = self.doc.text.lines().count().max(1) as f32;
+                        let target_line = if self.last_view == ViewMode::Source {
+                            // Source top line from pitch.
+                            let pitch = self.editor_pitch.max(1.0);
+                            let line = (self.src_scroll.offset / pitch).floor().max(0.0) as usize;
+                            Some(line)
+                        } else {
+                            // Preview -> Source: if we are exactly on a heading
+                            // (outline click), keep that heading; otherwise use
+                            // proportional line for manual mid-section scrolls.
+                            let mut heading_line: Option<usize> = None;
+                            if !self.preview.heading_ys.is_empty() {
+                                if let Some(active) = self.active_outline {
+                                    if let Some(idx) =
+                                        self.headings.iter().position(|h| h.line == active)
+                                    {
+                                        if idx < self.preview.heading_ys.len() {
+                                            let hy = self.preview.heading_ys[idx];
+                                            if (hy - self.prev_scroll.offset).abs() < 8.0 {
+                                                heading_line = Some(active);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            heading_line.or_else(|| {
+                                let frac = (self.prev_scroll.offset
+                                    / (self.prev_scroll.content - self.prev_scroll.viewport)
+                                        .max(1.0))
+                                .clamp(0.0, 1.0);
+                                Some((frac * (total - 1.0)).floor().max(0.0) as usize)
+                            })
+                        };
+                        if let Some(line) = target_line {
+                            let clamped = (line as f32).min(total - 1.0).max(0.0) as usize;
+                            self.jump = Some(clamped);
+                            // Jump handles the scroll with Align::Min (top), so
+                            // discard the old fractional override.
+                            self.scroll_override = None;
+                        } else {
+                            // Fallback to old fractional override (should rarely happen).
+                            let (from, to) = if self.last_view == ViewMode::Source {
+                                (self.src_scroll, self.prev_scroll)
+                            } else {
+                                (self.prev_scroll, self.src_scroll)
+                            };
+                            let frac = (from.offset / (from.content - from.viewport).max(1.0))
+                                .clamp(0.0, 1.0);
+                            self.scroll_override =
+                                Some(frac * (to.content - to.viewport).max(0.0));
+                        }
                     } else {
-                        (self.prev_scroll, self.src_scroll)
-                    };
-                    let frac = (from.offset / (from.content - from.viewport).max(1.0))
-                        .clamp(0.0, 1.0);
-                    self.scroll_override =
-                        Some(frac * (to.content - to.viewport).max(0.0));
+                        self.scroll_override = None;
+                    }
                 }
                 self.last_view = self.state.view;
 
@@ -761,8 +812,8 @@ impl App {
                     }
                     ViewMode::Preview => {
                         let ov = self.scroll_override.take();
-                        let Self { doc, preview, cur_dark, prev_scroll, .. } = self;
-                        *prev_scroll = preview_pane(ui, doc, preview, *cur_dark, ov);
+                        let Self { doc, preview, cur_dark, prev_scroll, jump, .. } = self;
+                        *prev_scroll = preview_pane(ui, doc, preview, *cur_dark, jump, ov);
                     }
                 }
             });
@@ -782,6 +833,11 @@ impl App {
             )
             .show(ctx, |ui| {
                 self.outline_rect = Some(ui.max_rect());
+                // Outline titles are click targets, not selectable text. Keep the
+                // search field editable, but prevent every Label in here from
+                // becoming drag-to-select (Text cursor) and stealing the row
+                // click.
+                ui.style_mut().interaction.selectable_labels = false;
                 // Splitter metrics first: available height shrinks as content
                 // is laid out, so measure before adding widgets. The handle
                 // itself is allocated at the very end (allocating it up-front
@@ -942,7 +998,7 @@ impl App {
                                             } else {
                                                 ui.add_space(20.0);
                                             }
-                                            ui.add(Label::new(rt).truncate());
+                                            ui.add(Label::new(rt).truncate().selectable(false));
                                         },
                                     );
                                 },
@@ -957,9 +1013,6 @@ impl App {
                             } else if resp.clicked() {
                                 self.jump = Some(h.line);
                                 self.active_outline = Some(h.line);
-                                if self.state.view == ViewMode::Preview {
-                                    self.state.view = ViewMode::Source;
-                                }
                             }
 
                             if has_children {
@@ -1843,19 +1896,19 @@ fn editor_pane(
             let h = out.response.rect.height() - margin * 2.0;
             if h > 4.0 {
                 let p = (h / lines as f32).max(1.0);
-                *pitch = if prev_pitch > 1.0 { prev_pitch * 0.6 + p * 0.4 } else { p };
+                *pitch = p;
             }
             if let Some(line) = jump.take() {
                 let y = line as f32 * (*pitch).max(1.0);
                 let top = out.response.rect.min + egui::vec2(margin, margin);
                 let marker = egui::Rect::from_min_size(
-                    top + egui::vec2(0.0, (y - 40.0).max(0.0)),
-                    egui::vec2(1.0, 40.0),
+                    top + egui::vec2(0.0, y.max(0.0)),
+                    egui::vec2(1.0, 20.0),
                 );
                 let inner = ui.allocate_new_ui(UiBuilder::new().max_rect(marker), |ui| {
                     ui.allocate_exact_size(egui::Vec2::ZERO, Sense::hover())
                 });
-                inner.inner.1.scroll_to_me(Some(Align::Center));
+                inner.inner.1.scroll_to_me(Some(Align::Min));
             }
             // Trailing canvas: lets the last line scroll up from the viewport
             // bottom (Obsidian-style scroll-past-end). View-only padding,
@@ -1875,6 +1928,7 @@ fn preview_pane(
     doc: &mut Document,
     pv: &mut preview::Preview,
     dark: bool,
+    jump: &mut Option<usize>,
     scroll_override: Option<f32>,
 ) -> ViewScroll {
     // Same trackless treatment as the editor pane: hide the full-height
@@ -1890,13 +1944,55 @@ fn preview_pane(
     if let Some(y) = scroll_override {
         area = area.vertical_scroll_offset(y);
     }
+    // Take the line jump before the closure. For headings we use a
+    // precise heading-anchored scroll inside `preview::show_with_target`;
+    // for non-heading lines (e.g. Find) fall back to a line-proportional
+    // estimate.
+    let target_line = jump.take();
+    let target_heading = target_line.and_then(|line| {
+        crate::markdown::outline(&doc.text)
+            .iter()
+            .position(|h| h.line == line)
+    });
     let out = area.show(ui, |ui| {
+            let content_start = ui.cursor().top();
+            let content_left = ui.min_rect().left();
             let base = doc.path.as_ref().and_then(|p| parent_of(p));
             let version = doc.version;
-            preview::show(ui, pv, &doc.text, base.as_deref(), dark, version);
+            if target_heading.is_some() {
+                preview::show_with_target(
+                    ui,
+                    pv,
+                    &doc.text,
+                    base.as_deref(),
+                    dark,
+                    version,
+                    target_heading,
+                );
+            } else {
+                preview::show(ui, pv, &doc.text, base.as_deref(), dark, version);
+            }
+            let content_before_pad = ui.cursor().top();
             // Same trailing canvas as the editor: view-only, never saved.
             let pad = (ui.clip_rect().height() - 40.0).max(120.0);
             ui.add_space(pad);
+            if let Some(line) = target_line {
+                if target_heading.is_none() {
+                    // Fallback for non-heading jumps (Find etc.).
+                    let total = doc.text.lines().count().max(1) as f32;
+                    let content_h = (content_before_pad - content_start).max(1.0);
+                    let avg = content_h / total;
+                    let y = content_start + (line as f32 * avg).min(content_h - 1.0);
+                    let marker = egui::Rect::from_min_size(
+                        egui::pos2(content_left, y),
+                        egui::vec2(10.0, 20.0),
+                    );
+                    let inner = ui.allocate_new_ui(UiBuilder::new().max_rect(marker), |ui| {
+                        ui.allocate_exact_size(egui::Vec2::ZERO, Sense::hover())
+                    });
+                    inner.inner.1.scroll_to_me(Some(Align::Min));
+                }
+            }
         });
     ViewScroll {
         offset: out.state.offset.y,

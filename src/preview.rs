@@ -26,6 +26,7 @@ pub struct Preview {
     images: HashMap<PathBuf, ((SystemTime, u64), TextureHandle)>,
     code: HashMap<(u64, bool), Arc<Vec<Spans>>>,
     pub content_height: f32,
+    pub heading_ys: Vec<f32>,
 }
 
 impl Preview {
@@ -35,6 +36,7 @@ impl Preview {
             images: HashMap::new(),
             code: HashMap::new(),
             content_height: 0.0,
+            heading_ys: Vec::new(),
         }
     }
 
@@ -139,6 +141,10 @@ struct Cfg<'a> {
     pv: &'a mut Preview,
     depth: usize,
     block_no: usize,
+    next_heading: usize,
+    target_heading: Option<usize>,
+    target_top: Option<f32>,
+    content_start: f32,
 }
 
 const MAX_NESTING: usize = 48;
@@ -183,8 +189,31 @@ fn heading_num(level: &HeadingLevel) -> u8 {
 }
 
 pub fn show(ui: &mut Ui, pv: &mut Preview, text: &str, base: Option<&Path>, dark: bool, version: u64) {
+    show_with_target(ui, pv, text, base, dark, version, None)
+}
+
+pub fn show_with_target(
+    ui: &mut Ui,
+    pv: &mut Preview,
+    text: &str,
+    base: Option<&Path>,
+    dark: bool,
+    version: u64,
+    target_heading: Option<usize>,
+) {
     let evs = pv.events_for(version, text);
-    let mut cfg = Cfg { base, dark, pv, depth: 0, block_no: 0 };
+    let mut cfg = Cfg {
+        base,
+        dark,
+        pv,
+        depth: 0,
+        block_no: 0,
+        next_heading: 0,
+        target_heading,
+        target_top: None,
+        content_start: 0.0,
+    };
+    cfg.pv.heading_ys.clear();
     let top = ui.cursor().top();
 
     ui.add_space(12.0);
@@ -199,6 +228,7 @@ pub fn show(ui: &mut Ui, pv: &mut Preview, text: &str, base: Option<&Path>, dark
             ui.add_space(side);
             ui.vertical(|ui| {
                 ui.set_max_width(content_w - ui.style().spacing.item_spacing.x);
+                cfg.content_start = ui.cursor().top();
                 let mut i = 0usize;
                 let mut first = true;
                 while i < evs.len() {
@@ -751,6 +781,20 @@ fn paragraph(ui: &mut Ui, cfg: &mut Cfg, evs: &[Event], i: &mut usize) {
 }
 
 fn heading(ui: &mut Ui, cfg: &mut Cfg, evs: &[Event], i: &mut usize, lvl: u8) {
+    let idx = cfg.next_heading;
+    cfg.next_heading += 1;
+    let top_before = ui.cursor().top();
+    // Record heading top relative to content_start for scroll sync.
+    let rel = (top_before - cfg.content_start).max(0.0);
+    cfg.pv.heading_ys.push(rel);
+    let is_target = cfg.target_heading == Some(idx);
+    if is_target {
+        // Zero-size marker at the very top of this heading; scrolling it to
+        // Min puts the heading at the viewport top, consistently.
+        let r = egui::Rect::from_min_size(egui::pos2(ui.min_rect().left(), top_before), Vec2::ZERO);
+        let resp = ui.allocate_rect(r, Sense::hover());
+        resp.scroll_to_me(Some(egui::Align::Min));
+    }
     let pal = theme::palette(cfg.dark);
     let sizes = [26.0, 21.5, 18.0, 16.0, 14.8, 13.8];
     let size = sizes[(lvl as usize).min(6) - 1];
