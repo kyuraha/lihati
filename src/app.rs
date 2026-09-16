@@ -163,6 +163,7 @@ impl App {
         }
         app.ensure_root_for_current();
         app.refresh_derived();
+        app.load_outline_collapsed();
         app
     }
 
@@ -182,6 +183,36 @@ impl App {
         self.state.recents.retain(|r| r != &s);
         self.state.recents.insert(0, s);
         self.state.recents.truncate(10);
+    }
+
+    fn collapsed_key(path: &Path) -> String {
+        path.to_string_lossy().to_string()
+    }
+
+    fn save_outline_collapsed(&mut self) {
+        if let Some(p) = &self.doc.path.clone() {
+            let k = Self::collapsed_key(p);
+            if self.outline_collapsed.is_empty() {
+                self.state.outline_collapsed.remove(&k);
+            } else {
+                let mut v: Vec<usize> = self.outline_collapsed.iter().copied().collect();
+                v.sort_unstable();
+                self.state.outline_collapsed.insert(k, v);
+            }
+        }
+    }
+
+    fn load_outline_collapsed(&mut self) {
+        if let Some(p) = &self.doc.path {
+            let k = Self::collapsed_key(p);
+            if let Some(v) = self.state.outline_collapsed.get(&k) {
+                self.outline_collapsed = v.iter().copied().collect();
+            } else {
+                self.outline_collapsed.clear();
+            }
+        } else {
+            self.outline_collapsed.clear();
+        }
     }
 
     fn ensure_root_for_current(&mut self) {
@@ -252,6 +283,7 @@ impl App {
             self.pending = Some(Pending::Open(path));
             return;
         }
+        self.save_outline_collapsed();
         match self.doc.load(&path) {
             Ok(()) => {
                 self.push_recent(&path);
@@ -259,6 +291,7 @@ impl App {
                 self.vanished_banner = false;
                 self.jump = None;
                 self.active_outline = None;
+                self.load_outline_collapsed();
                 self.note_large_file();
                 self.ensure_root_for_current();
                 self.state.last_file = Some(path.to_string_lossy().to_string());
@@ -276,11 +309,13 @@ impl App {
     }
 
     fn do_new(&mut self) {
+        self.save_outline_collapsed();
         self.doc = Document::new();
         self.conflict_disk_text = None;
         self.vanished_banner = false;
         self.jump = None;
         self.active_outline = None;
+        self.load_outline_collapsed();
     }
 
     fn save_current(&mut self) {
@@ -315,6 +350,7 @@ impl App {
                         self.ensure_root_for_current();
                         self.vanished_banner = false;
                         self.state.last_file = Some(p.to_string_lossy().to_string());
+                        self.save_outline_collapsed();
                         true
                     }
                     Err(e) => {
@@ -1010,6 +1046,7 @@ impl App {
                                 } else {
                                     self.outline_collapsed.remove(&h.line);
                                 }
+                                self.save_outline_collapsed();
                             } else if resp.clicked() {
                                 self.jump = Some(h.line);
                                 self.active_outline = Some(h.line);
@@ -1461,6 +1498,7 @@ fn sync_state(app: &mut App) {
         .map(|p| p.to_string_lossy().to_string());
     app.state.root = app.root.as_ref().map(|p| p.to_string_lossy().to_string());
     app.state.outline_width = Some(app.outline_width);
+    app.save_outline_collapsed();
 }
 
 fn parent_of(path: &Path) -> Option<PathBuf> {

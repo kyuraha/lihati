@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 
 pub const STATE_KEY: &str = "lihati_state_v1";
@@ -69,6 +71,8 @@ pub struct PersistState {
     pub recents: Vec<String>,
     #[serde(default)]
     pub outline_width: Option<f32>,
+    #[serde(default)]
+    pub outline_collapsed: HashMap<String, Vec<usize>>,
 }
 
 impl Default for PersistState {
@@ -83,6 +87,7 @@ impl Default for PersistState {
             last_file: None,
             recents: Vec::new(),
             outline_width: None,
+            outline_collapsed: HashMap::new(),
         }
     }
 }
@@ -114,6 +119,8 @@ mod tests {
         s.root = Some("C:\\notes".into());
         s.recents = vec!["a.md".into(), "b.md".into()];
         s.outline_width = Some(300.0);
+        s.outline_collapsed
+            .insert("C:\\a.md".into(), vec![10, 42]);
 
         let json = serde_json::to_string(&s).unwrap();
         let back: PersistState = serde_json::from_str(&json).unwrap();
@@ -124,6 +131,27 @@ mod tests {
         assert_eq!(back.recents.len(), 2);
         assert!(!back.show_dir);
         assert!(back.show_outline);
+        assert_eq!(back.outline_collapsed.get("C:\\a.md").unwrap(), &vec![10, 42]);
+    }
+
+    #[test]
+    fn outline_collapsed_per_file_roundtrip() {
+        let mut s = PersistState::default();
+        s.outline_collapsed
+            .insert("C:\\a.md".into(), vec![3, 7]);
+        s.outline_collapsed
+            .insert("C:\\b.md".into(), vec![12]);
+        let json = serde_json::to_string(&s).unwrap();
+        let back: PersistState = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.outline_collapsed.len(), 2);
+        assert_eq!(back.outline_collapsed["C:\\a.md"], vec![3, 7]);
+    }
+
+    #[test]
+    fn old_state_without_collapsed_still_loads() {
+        let raw = r#"{"show_dir":true,"show_outline":true,"view":"Source","theme":"Light","zoom":1.0,"recents":[]}"#;
+        let back: PersistState = serde_json::from_str(raw).unwrap();
+        assert!(back.outline_collapsed.is_empty());
     }
 
     #[test]
