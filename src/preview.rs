@@ -149,7 +149,10 @@ struct Cfg<'a> {
 
 const MAX_NESTING: usize = 48;
 
-const BODY: f32 = 15.5;
+const BODY: f32 = 16.0;
+// Obsidian defaults: 16px text, 1.5 line height, tighter headings.
+const BODY_LEADING: f32 = 1.5;
+const HEAD_LEADING: f32 = 1.38;
 
 fn closes(start: &Tag, end: &pulldown_cmark::TagEnd) -> bool {
     use pulldown_cmark::TagEnd as E;
@@ -474,7 +477,9 @@ impl<'a> InlineSt<'a> {
     fn new(width: f32, pal: theme::Palette) -> Self {
         let mut job = LayoutJob::default();
         job.wrap.max_width = if width.is_finite() && width > 40.0 { width } else { 480.0 };
-        job.wrap.break_anywhere = true;
+        // Wrap by word like Obsidian: breaking inside words looks ragged
+        // and makes body text feel harsher than it is.
+        job.wrap.break_anywhere = false;
         InlineSt {
             job,
             italics: 0,
@@ -501,7 +506,12 @@ impl<'a> InlineSt<'a> {
             return;
         }
         let size = self.head_size.unwrap_or(BODY);
-        let family = if self.head_size.is_some() || self.strong > 0 {
+        let is_head = self.head_size.is_some();
+        let is_strong = self.strong > 0;
+        // Inline strong uses the real bold face of the same family at the
+        // same size and same color: visible through weight alone, calm
+        // like Obsidian's default bold.
+        let family = if is_head || is_strong {
             theme::family_bold()
         } else if self.italics > 0 {
             theme::family_italic()
@@ -533,6 +543,7 @@ impl<'a> InlineSt<'a> {
                 } else {
                     Stroke::NONE
                 },
+                line_height: Some(size * if is_head { HEAD_LEADING } else { BODY_LEADING }),
                 ..Default::default()
             },
         );
@@ -543,12 +554,14 @@ impl<'a> InlineSt<'a> {
 
     fn push_code(&mut self, text: &str) {
         let p = &self.pal;
+        let size = self.head_size.unwrap_or(14.0);
         self.job.append(
             text, 0.0,
             TextFormat {
-                font_id: FontId::new(self.head_size.unwrap_or(14.0), FontFamily::Monospace),
+                font_id: FontId::new(size, FontFamily::Monospace),
                 color: p.text,
                 background: p.faint_fill,
+                line_height: Some(size * BODY_LEADING),
                 ..Default::default()
             },
         );
@@ -568,6 +581,22 @@ fn inline_until(cfg: &Cfg, evs: &[Event], i: &mut usize, stop: Stop, st: &mut In
             Event::End(e) if inline_stop(stop, e) => {
                 *i += 1;
                 return;
+            }
+            Event::End(E::Emphasis) => {
+                st.italics = st.italics.saturating_sub(1);
+                *i += 1;
+            }
+            Event::End(E::Strong) => {
+                st.strong = st.strong.saturating_sub(1);
+                *i += 1;
+            }
+            Event::End(E::Strikethrough) => {
+                st.strike = st.strike.saturating_sub(1);
+                *i += 1;
+            }
+            Event::End(E::Link) => {
+                st.link = None;
+                *i += 1;
             }
             Event::Text(t) => {
                 st.push(t);
@@ -796,21 +825,15 @@ fn heading(ui: &mut Ui, cfg: &mut Cfg, evs: &[Event], i: &mut usize, lvl: u8) {
         resp.scroll_to_me(Some(egui::Align::Min));
     }
     let pal = theme::palette(cfg.dark);
-    let sizes = [26.0, 21.5, 18.0, 16.0, 14.8, 13.8];
+    // Compressed Obsidian-like scale: hierarchy stays readable, but no
+    // giant H1 shouting over body text. Deep levels settle at/near body
+    // size; the outline panel carries the structural difference.
+    let sizes = [21.0, 19.0, 17.5, 16.5, 16.0, 15.5];
     let size = sizes[(lvl as usize).min(6) - 1];
     let mut st = InlineSt::new(ui.available_width(), pal);
     st.head_size = Some(size);
     inline_until(cfg, evs, i, Stop::Head, &mut st);
     add_inline(ui, st);
-    if lvl <= 2 {
-        ui.add_space(4.0);
-        let w = ui.available_width();
-        let (rect, _) = ui.allocate_exact_size(Vec2::new(w, 1.0), Sense::hover());
-        ui.painter().line_segment(
-            [egui::pos2(rect.left(), rect.top()), egui::pos2(rect.right(), rect.top())],
-            Stroke::new(1.0_f32, pal.stroke),
-        );
-    }
     ui.add_space(4.0);
 }
 
@@ -944,9 +967,9 @@ fn code_block(ui: &mut Ui, cfg: &mut Cfg, evs: &[Event], i: &mut usize, lang: Op
         .stroke(Stroke::new(1.0_f32, pal.stroke.gamma_multiply(0.6)));
     let rr = frame.show(ui, |ui| {
         let mut job = LayoutJob::default();
-        let w = ui.available_width();
-        job.wrap.max_width = if w.is_finite() && w > 40.0 { w } else { 480.0 };
-        job.wrap.break_anywhere = true;
+        // Like Obsidian (`pre { overflow-x: auto }`): code never wraps,
+        // long lines scroll sideways instead of being chopped mid-word.
+        job.wrap.max_width = f32::INFINITY;
         let mono = FontId::monospace(13.0);
         let n = lines.len();
         for (idx, row) in lines.iter().enumerate() {
@@ -957,7 +980,12 @@ fn code_block(ui: &mut Ui, cfg: &mut Cfg, evs: &[Event], i: &mut usize, lang: Op
                 job.append("\n", 0.0, TextFormat::simple(mono.clone(), pal.weak));
             }
         }
-        ui.add(Label::new(job).selectable(true));
+        egui::ScrollArea::horizontal()
+            .id_salt(("lihati-code-scroll", cfg.block_no))
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.add(Label::new(job).selectable(true));
+            });
     });
 
     let resp = ui.interact(rr.response.rect, id, Sense::click());
@@ -1087,7 +1115,9 @@ fn table(
         let wrap_w = (w - PAD_X).max(28.0);
         let mut job = LayoutJob::default();
         job.wrap.max_width = wrap_w;
-        job.wrap.break_anywhere = true;
+        // Word wrap like Obsidian tables: break between words (falling
+        // back to `-`/punctuation for long tokens), never mid-word.
+        job.wrap.break_anywhere = false;
         job.append(text, 0.0, TextFormat::simple(font.clone(), pal.text));
         let g = ui.painter().layout_job(job);
         let x_off = match align {
@@ -1390,4 +1420,74 @@ fn render_image_block(ui: &mut Ui, cfg: &mut Cfg, dest: &str, alt: &str, pal: th
         ui.label(eframe::egui::RichText::new(label).weak().size(13.0));
     });
     ui.add_space(2.0);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(text: &str) -> Vec<Event<'static>> {
+        let mut opts = Options::empty();
+        opts.insert(Options::ENABLE_TABLES);
+        opts.insert(Options::ENABLE_TASKLISTS);
+        opts.insert(Options::ENABLE_STRIKETHROUGH);
+        Parser::new_ext(text, opts).map(own_event).collect()
+    }
+
+    fn run_inline(evs: &[Event], from: usize, stop: Stop, dark: bool) -> InlineSt<'static> {
+        let mut pv = Preview::new();
+        let cfg = Cfg {
+            base: None,
+            dark,
+            pv: &mut pv,
+            depth: 0,
+            block_no: 0,
+            next_heading: 0,
+            target_heading: None,
+            target_top: None,
+            content_start: 0.0,
+        };
+        let pal = theme::palette(dark);
+        let mut st = InlineSt::new(480.0, pal);
+        let mut i = from;
+        inline_until(&cfg, evs, &mut i, stop, &mut st);
+        st
+    }
+
+    #[test]
+    fn strong_does_not_leak_past_its_end() {
+        let evs = parse("a **b** c");
+        let st = run_inline(&evs, 1, Stop::Para, true);
+        assert_eq!(st.job.text, "a b c");
+        assert_eq!(st.strong, 0);
+        let pal = theme::palette(true);
+        // Only "b" uses the bold face; everything shares body color.
+        let families: Vec<FontFamily> =
+            st.job.sections.iter().map(|s| s.format.font_id.family.clone()).collect();
+        assert_eq!(
+            families,
+            vec![
+                FontFamily::Proportional,
+                theme::family_bold(),
+                FontFamily::Proportional
+            ]
+        );
+        for s in &st.job.sections {
+            assert_eq!(s.format.color, pal.text);
+        }
+    }
+
+    #[test]
+    fn emphasis_strike_and_link_reset() {
+        let evs = parse("a *b* c ~~d~~ e [f](https://x.test) g");
+        let st = run_inline(&evs, 1, Stop::Para, false);
+        assert_eq!(st.italics, 0);
+        assert_eq!(st.strike, 0);
+        assert!(st.link.is_none());
+        let pal = theme::palette(false);
+        let colors: Vec<Color32> = st.job.sections.iter().map(|s| s.format.color).collect();
+        // Trailing " g" must be plain body text, not struck/link-colored.
+        assert_eq!(colors.last(), Some(&pal.text));
+        assert!(colors.contains(&pal.accent));
+    }
 }

@@ -18,6 +18,15 @@ pub fn family_italic() -> FontFamily {
     FontFamily::Name(ITALIC_FAMILY_NAME.into())
 }
 
+/// Read a typeface installed with the OS (e.g. Segoe UI on Windows).
+/// Returns `None` when the file is missing so bundled Inter stays
+/// as the fallback. Using the system font for reading text matches
+/// what Obsidian does by default and renders more comfortably here.
+fn system_font_bytes(file_name: &str) -> Option<Vec<u8>> {
+    let root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string());
+    std::fs::read(std::path::Path::new(&root).join("Fonts").join(file_name)).ok()
+}
+
 pub fn init_fonts(ctx: &egui::Context) {
     let mut fonts = FontDefinitions::default();
     fonts.font_data.insert("inter-400".into(), FontData::from_static(INTER_400).into());
@@ -25,14 +34,34 @@ pub fn init_fonts(ctx: &egui::Context) {
     fonts.font_data.insert("inter-italic".into(), FontData::from_static(INTER_ITALIC).into());
     fonts.font_data.insert("jbmono-400".into(), FontData::from_static(MONO_400).into());
 
+    // Prefer the OS reading font (Segoe UI on Windows, like Obsidian's
+    // default text font); fall back to bundled Inter when unavailable.
+    let mut regular: Vec<String> = vec!["inter-400".into()];
+    let mut bold: Vec<String> = vec!["inter-700".into()];
+    let mut italic: Vec<String> = vec!["inter-italic".into()];
+    if let Some(bytes) = system_font_bytes("segoeui.ttf") {
+        fonts.font_data.insert("system-sans".into(), FontData::from_owned(bytes).into());
+        regular.insert(0, "system-sans".into());
+    }
+    if let Some(bytes) = system_font_bytes("segoeuib.ttf") {
+        fonts.font_data.insert("system-sans-bold".into(), FontData::from_owned(bytes).into());
+        bold.insert(0, "system-sans-bold".into());
+    }
+    if let Some(bytes) = system_font_bytes("segoeuii.ttf") {
+        fonts.font_data.insert("system-sans-italic".into(), FontData::from_owned(bytes).into());
+        italic.insert(0, "system-sans-italic".into());
+    }
+
     if let Some(list) = fonts.families.get_mut(&FontFamily::Proportional) {
-        list.insert(0, "inter-400".into());
+        for name in regular.into_iter().rev() {
+            list.insert(0, name);
+        }
     }
     if let Some(list) = fonts.families.get_mut(&FontFamily::Monospace) {
         list.insert(0, "jbmono-400".into());
     }
-    fonts.families.insert(FontFamily::Name(BOLD_FAMILY_NAME.into()), vec!["inter-700".into()]);
-    fonts.families.insert(FontFamily::Name(ITALIC_FAMILY_NAME.into()), vec!["inter-italic".into()]);
+    fonts.families.insert(FontFamily::Name(BOLD_FAMILY_NAME.into()), bold);
+    fonts.families.insert(FontFamily::Name(ITALIC_FAMILY_NAME.into()), italic);
     ctx.set_fonts(fonts);
 }
 
@@ -142,7 +171,7 @@ fn styled(dark: bool) -> Style {
         ),
         (
             egui::TextStyle::Name("PreviewBody".into()),
-            egui::FontId::proportional(15.5),
+            egui::FontId::proportional(16.0),
         ),
     ]
     .into_iter()
